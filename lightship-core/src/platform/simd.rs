@@ -1,0 +1,923 @@
+//! SIMD optimized operator kernels
+//!
+//! Provides vectorized implementations of common neural network operators
+//! using SSE, AVX, AVX2, AVX-512, and NEON instructions.
+
+use crate::ir::Tensor;
+
+/// SIMD operation trait for runtime dispatch
+pub trait SimdOp: Send + Sync {
+    /// Execute the operation
+    fn execute(&self, input: &[f32], output: &mut [f32]);
+}
+
+/// SIMD level enumeration
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SimdLevel {
+    /// No SIMD support
+    None = 0,
+    /// SSE (128-bit)
+    Sse = 1,
+    /// SSE2 (128-bit)
+    Sse2 = 2,
+    /// SSE3 (128-bit)
+    Sse3 = 3,
+    /// Supplemental SSE3 (128-bit)
+    Ssse3 = 4,
+    /// SSE4.1 (128-bit)
+    Sse4_1 = 5,
+    /// SSE4.2 (128-bit)
+    Sse4_2 = 6,
+    /// AVX (256-bit)
+    Avx = 7,
+    /// AVX2 (256-bit)
+    Avx2 = 8,
+    /// AVX-512 (512-bit)
+    Avx512 = 9,
+    /// NEON (128-bit ARM)
+    Neon = 10,
+    /// NEON with FP16 (ARM)
+    Neonfp16 = 11,
+}
+
+impl SimdLevel {
+    /// Get vector width in bytes
+    pub fn vector_width(&self) -> usize {
+        match self {
+            SimdLevel::None => 0,
+            SimdLevel::Sse | SimdLevel::Sse2 | SimdLevel::Sse3 |
+            SimdLevel::Ssse3 | SimdLevel::Sse4_1 | SimdLevel::Sse4_2 |
+            SimdLevel::Avx | SimdLevel::Neon | SimdLevel::Neonfp16 => 16,
+            SimdLevel::Avx2 => 32,
+            SimdLevel::Avx512 => 64,
+        }
+    }
+
+    /// Get the number of f32 elements per vector
+    pub fn f32_per_vector(&self) -> usize {
+        self.vector_width() / 4
+    }
+}
+
+// ============================================================================
+// Platform-agnostic function that dispatches to the right implementation
+// ============================================================================
+
+/// Get the optimal SIMD level for this platform
+pub fn detect_simd_level() -> SimdLevel {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx512f") {
+            SimdLevel::Avx512
+        } else if is_x86_feature_detected!("avx2") {
+            SimdLevel::Avx2
+        } else if is_x86_feature_detected!("avx") {
+            SimdLevel::Avx
+        } else if is_x86_feature_detected!("sse4.2") {
+            SimdLevel::Sse4_2
+        } else if is_x86_feature_detected!("sse4.1") {
+            SimdLevel::Sse4_1
+        } else if is_x86_feature_detected!("ssse3") {
+            SimdLevel::Ssse3
+        } else if is_x86_feature_detected!("sse3") {
+            SimdLevel::Sse3
+        } else if is_x86_feature_detected!("sse2") {
+            SimdLevel::Sse2
+        } else {
+            SimdLevel::None
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // NEON is always available on ARM64
+        SimdLevel::Neon
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        SimdLevel::None
+    }
+}
+
+/// ReLU: max(0, x) - dispatches to best available implementation
+pub fn relu_simd(input: &[f32], output: &mut [f32], level: SimdLevel) {
+    let len = input.len().min(output.len());
+    #[cfg(target_arch = "x86_64")]
+    {
+        match level {
+            SimdLevel::Avx512 => { unsafe { relu_avx512(input, output, len) }; return; }
+            SimdLevel::Avx2 => { unsafe { relu_avx2(input, output, len) }; return; }
+            SimdLevel::Avx => { unsafe { relu_avx(input, output, len) }; return; }
+            SimdLevel::Sse2 | SimdLevel::Neon => { unsafe { relu_sse(input, output, len) }; return; }
+            _ => {}
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if matches!(level, SimdLevel::Neon | SimdLevel::Neonfp16) {
+            unsafe { relu_neon(input, output, len) };
+            return;
+        }
+    }
+    relu_scalar(input, output, len);
+}
+
+/// ReLU6: clamp(x, 0, 6) - dispatches to best available implementation
+pub fn relu6_simd(input: &[f32], output: &mut [f32], level: SimdLevel) {
+    let len = input.len().min(output.len());
+    #[cfg(target_arch = "x86_64")]
+    {
+        match level {
+            SimdLevel::Avx512 => { unsafe { relu6_avx512(input, output, len) }; return; }
+            SimdLevel::Avx2 => { unsafe { relu6_avx2(input, output, len) }; return; }
+            SimdLevel::Avx => { unsafe { relu6_avx(input, output, len) }; return; }
+            SimdLevel::Sse2 | SimdLevel::Neon => { unsafe { relu6_sse(input, output, len) }; return; }
+            _ => {}
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if matches!(level, SimdLevel::Neon | SimdLevel::Neonfp16) {
+            unsafe { relu6_neon(input, output, len) };
+            return;
+        }
+    }
+    relu6_scalar(input, output, len);
+}
+
+/// Element-wise addition: c = a + b
+pub fn add_simd(a: &[f32], b: &[f32], c: &mut [f32], level: SimdLevel) {
+    assert_eq!(a.len(), b.len());
+    assert_eq!(a.len(), c.len());
+    let len = a.len();
+    #[cfg(target_arch = "x86_64")]
+    {
+        match level {
+            SimdLevel::Avx512 => { unsafe { add_avx512(a, b, c, len) }; return; }
+            SimdLevel::Avx2 => { unsafe { add_avx2(a, b, c, len) }; return; }
+            SimdLevel::Avx => { unsafe { add_avx(a, b, c, len) }; return; }
+            SimdLevel::Sse2 | SimdLevel::Neon => { unsafe { add_sse(a, b, c, len) }; return; }
+            _ => {}
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if matches!(level, SimdLevel::Neon | SimdLevel::Neonfp16) {
+            unsafe { add_neon(a, b, c, len) };
+            return;
+        }
+    }
+    add_scalar(a, b, c, len);
+}
+
+/// Element-wise multiplication: c = a * b
+pub fn mul_simd(a: &[f32], b: &[f32], c: &mut [f32], level: SimdLevel) {
+    assert_eq!(a.len(), b.len());
+    assert_eq!(a.len(), c.len());
+    let len = a.len();
+    #[cfg(target_arch = "x86_64")]
+    {
+        match level {
+            SimdLevel::Avx512 => { unsafe { mul_avx512(a, b, c, len) }; return; }
+            SimdLevel::Avx2 => { unsafe { mul_avx2(a, b, c, len) }; return; }
+            SimdLevel::Avx => { unsafe { mul_avx(a, b, c, len) }; return; }
+            SimdLevel::Sse2 | SimdLevel::Neon => { unsafe { mul_sse(a, b, c, len) }; return; }
+            _ => {}
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if matches!(level, SimdLevel::Neon | SimdLevel::Neonfp16) {
+            unsafe { mul_neon(a, b, c, len) };
+            return;
+        }
+    }
+    mul_scalar(a, b, c, len);
+}
+
+/// GEMM: C = A * B + C
+/// - A: [M x K], B: [K x N], C: [M x N]
+pub fn gemm_simd(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize, level: SimdLevel) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        match level {
+            SimdLevel::Avx512 => { unsafe { gemm_avx512(a, b, c, m, n, k) }; return; }
+            SimdLevel::Avx2 => { unsafe { gemm_avx2(a, b, c, m, n, k) }; return; }
+            SimdLevel::Avx | SimdLevel::Sse2 | SimdLevel::Neon => { unsafe { gemm_sse(a, b, c, m, n, k) }; return; }
+            _ => {}
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if matches!(level, SimdLevel::Neon | SimdLevel::Neonfp16) {
+            unsafe { gemm_neon(a, b, c, m, n, k) };
+            return;
+        }
+    }
+    gemm_scalar(a, b, c, m, n, k);
+}
+
+/// Compute horizontal sum of array
+pub fn horizontal_sum(arr: &[f32], level: SimdLevel) -> f32 {
+    let len = arr.len();
+    #[cfg(target_arch = "x86_64")]
+    {
+        match level {
+            SimdLevel::Avx512 => { return unsafe { horizontal_sum_avx512(arr, len) }; }
+            SimdLevel::Avx2 => { return unsafe { horizontal_sum_avx2(arr, len) }; }
+            SimdLevel::Avx | SimdLevel::Sse2 | SimdLevel::Neon => { return unsafe { horizontal_sum_sse(arr, len) }; }
+            _ => {}
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if matches!(level, SimdLevel::Neon | SimdLevel::Neonfp16) {
+            return unsafe { horizontal_sum_neon(arr, len) };
+        }
+    }
+    horizontal_sum_scalar(arr, len)
+}
+
+// ============================================================================
+// Scalar implementations (fallback)
+// ============================================================================
+
+fn relu_scalar(input: &[f32], output: &mut [f32], len: usize) {
+    for i in 0..len {
+        output[i] = if input[i] > 0.0 { input[i] } else { 0.0 };
+    }
+}
+
+fn relu6_scalar(input: &[f32], output: &mut [f32], len: usize) {
+    for i in 0..len {
+        output[i] = input[i].clamp(0.0, 6.0);
+    }
+}
+
+fn add_scalar(a: &[f32], b: &[f32], c: &mut [f32], len: usize) {
+    for i in 0..len {
+        c[i] = a[i] + b[i];
+    }
+}
+
+fn mul_scalar(a: &[f32], b: &[f32], c: &mut [f32], len: usize) {
+    for i in 0..len {
+        c[i] = a[i] * b[i];
+    }
+}
+
+fn gemm_scalar(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize) {
+    for m_idx in 0..m {
+        for n_idx in 0..n {
+            let mut sum = 0.0f32;
+            for k_idx in 0..k {
+                sum += a[m_idx * k + k_idx] * b[k_idx * n + n_idx];
+            }
+            c[m_idx * n + n_idx] += sum;
+        }
+    }
+}
+
+fn horizontal_sum_scalar(arr: &[f32], len: usize) -> f32 {
+    arr.iter().sum()
+}
+
+// ============================================================================
+// x86_64 SIMD implementations
+// ============================================================================
+
+#[cfg(target_arch = "x86_64")]
+mod x86_64_impls {
+    use super::*;
+
+    #[target_feature(enable = "avx512f")]
+    pub(super) unsafe fn relu_avx512(input: &[f32], output: &mut [f32], len: usize) {
+        use std::arch::x86_64::*;
+        let zero = _mm512_setzero_ps();
+        let mut i = 0;
+        while i + 16 <= len {
+            let data = _mm512_loadu_ps(&input[i]);
+            let result = _mm512_max_ps(zero, data);
+            _mm512_storeu_ps(&mut output[i], result);
+            i += 16;
+        }
+        while i < len {
+            output[i] = if input[i] > 0.0 { input[i] } else { 0.0 };
+            i += 1;
+        }
+    }
+
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn relu_avx2(input: &[f32], output: &mut [f32], len: usize) {
+        use std::arch::x86_64::*;
+        let zero = _mm256_setzero256();
+        let mut i = 0;
+        while i + 8 <= len {
+            let data = _mm256_loadu_ps(&input[i]);
+            let result = _mm256_max_ps(zero, data);
+            _mm256_storeu_ps(&mut output[i], result);
+            i += 8;
+        }
+        while i < len {
+            output[i] = if input[i] > 0.0 { input[i] } else { 0.0 };
+            i += 1;
+        }
+    }
+
+    #[target_feature(enable = "avx")]
+    pub(super) unsafe fn relu_avx(input: &[f32], output: &mut [f32], len: usize) {
+        use std::arch::x86_64::*;
+        let zero = _mm256_setzero256();
+        let mut i = 0;
+        while i + 8 <= len {
+            let data = _mm256_loadu_ps(&input[i]);
+            let result = _mm256_max_ps(zero, data);
+            _mm256_storeu_ps(&mut output[i], result);
+            i += 8;
+        }
+        while i < len {
+            output[i] = if input[i] > 0.0 { input[i] } else { 0.0 };
+            i += 1;
+        }
+    }
+
+    #[target_feature(enable = "sse2")]
+    pub(super) unsafe fn relu_sse(input: &[f32], output: &mut [f32], len: usize) {
+        use std::arch::x86_64::*;
+        let zero = _mm_setzero_ps();
+        let mut i = 0;
+        while i + 4 <= len {
+            let data = _mm_loadu_ps(&input[i]);
+            let result = _mm_max_ps(zero, data);
+            _mm_storeu_ps(&mut output[i], result);
+            i += 4;
+        }
+        while i < len {
+            output[i] = if input[i] > 0.0 { input[i] } else { 0.0 };
+            i += 1;
+        }
+    }
+
+    #[target_feature(enable = "avx512f")]
+    pub(super) unsafe fn relu6_avx512(input: &[f32], output: &mut [f32], len: usize) {
+        use std::arch::x86_64::*;
+        let zero = _mm512_setzero_ps();
+        let six = _mm512_set1_ps(6.0);
+        let mut i = 0;
+        while i + 16 <= len {
+            let data = _mm512_loadu_ps(&input[i]);
+            let clamped = _mm512_min_ps(_mm512_max_ps(zero, data), six);
+            _mm512_storeu_ps(&mut output[i], clamped);
+            i += 16;
+        }
+        while i < len {
+            output[i] = input[i].clamp(0.0, 6.0);
+            i += 1;
+        }
+    }
+
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn relu6_avx2(input: &[f32], output: &mut [f32], len: usize) {
+        use std::arch::x86_64::*;
+        let zero = _mm256_setzero256();
+        let six = _mm256_set1_ps(6.0);
+        let mut i = 0;
+        while i + 8 <= len {
+            let data = _mm256_loadu_ps(&input[i]);
+            let clamped = _mm256_min_ps(_mm256_max_ps(zero, data), six);
+            _mm256_storeu_ps(&mut output[i], clamped);
+            i += 8;
+        }
+        while i < len {
+            output[i] = input[i].clamp(0.0, 6.0);
+            i += 1;
+        }
+    }
+
+    #[target_feature(enable = "avx")]
+    pub(super) unsafe fn relu6_avx(input: &[f32], output: &mut [f32], len: usize) {
+        use std::arch::x86_64::*;
+        let zero = _mm256_setzero256();
+        let six = _mm256_set1_ps(6.0);
+        let mut i = 0;
+        while i + 8 <= len {
+            let data = _mm256_loadu_ps(&input[i]);
+            let clamped = _mm256_min_ps(_mm256_max_ps(zero, data), six);
+            _mm256_storeu_ps(&mut output[i], clamped);
+            i += 8;
+        }
+        while i < len {
+            output[i] = input[i].clamp(0.0, 6.0);
+            i += 1;
+        }
+    }
+
+    #[target_feature(enable = "sse2")]
+    pub(super) unsafe fn relu6_sse(input: &[f32], output: &mut [f32], len: usize) {
+        use std::arch::x86_64::*;
+        let zero = _mm_setzero_ps();
+        let six = _mm_set1_ps(6.0);
+        let mut i = 0;
+        while i + 4 <= len {
+            let data = _mm_loadu_ps(&input[i]);
+            let clamped = _mm_min_ps(_mm_max_ps(zero, data), six);
+            _mm_storeu_ps(&mut output[i], clamped);
+            i += 4;
+        }
+        while i < len {
+            output[i] = input[i].clamp(0.0, 6.0);
+            i += 1;
+        }
+    }
+
+    #[target_feature(enable = "avx512f")]
+    pub(super) unsafe fn add_avx512(a: &[f32], b: &[f32], c: &mut [f32], len: usize) {
+        use std::arch::x86_64::*;
+        let mut i = 0;
+        while i + 16 <= len {
+            let va = _mm512_loadu_ps(&a[i]);
+            let vb = _mm512_loadu_ps(&b[i]);
+            let vc = _mm512_add_ps(va, vb);
+            _mm512_storeu_ps(&mut c[i], vc);
+            i += 16;
+        }
+        while i < len {
+            c[i] = a[i] + b[i];
+            i += 1;
+        }
+    }
+
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn add_avx2(a: &[f32], b: &[f32], c: &mut [f32], len: usize) {
+        use std::arch::x86_64::*;
+        let mut i = 0;
+        while i + 8 <= len {
+            let va = _mm256_loadu_ps(&a[i]);
+            let vb = _mm256_loadu_ps(&b[i]);
+            let vc = _mm256_add_ps(va, vb);
+            _mm256_storeu_ps(&mut c[i], vc);
+            i += 8;
+        }
+        while i < len {
+            c[i] = a[i] + b[i];
+            i += 1;
+        }
+    }
+
+    #[target_feature(enable = "avx")]
+    pub(super) unsafe fn add_avx(a: &[f32], b: &[f32], c: &mut [f32], len: usize) {
+        use std::arch::x86_64::*;
+        let mut i = 0;
+        while i + 8 <= len {
+            let va = _mm256_loadu_ps(&a[i]);
+            let vb = _mm256_loadu_ps(&b[i]);
+            let vc = _mm256_add_ps(va, vb);
+            _mm256_storeu_ps(&mut c[i], vc);
+            i += 8;
+        }
+        while i < len {
+            c[i] = a[i] + b[i];
+            i += 1;
+        }
+    }
+
+    #[target_feature(enable = "sse2")]
+    pub(super) unsafe fn add_sse(a: &[f32], b: &[f32], c: &mut [f32], len: usize) {
+        use std::arch::x86_64::*;
+        let mut i = 0;
+        while i + 4 <= len {
+            let va = _mm_loadu_ps(&a[i]);
+            let vb = _mm_loadu_ps(&b[i]);
+            let vc = _mm_add_ps(va, vb);
+            _mm_storeu_ps(&mut c[i], vc);
+            i += 4;
+        }
+        while i < len {
+            c[i] = a[i] + b[i];
+            i += 1;
+        }
+    }
+
+    #[target_feature(enable = "avx512f")]
+    pub(super) unsafe fn mul_avx512(a: &[f32], b: &[f32], c: &mut [f32], len: usize) {
+        use std::arch::x86_64::*;
+        let mut i = 0;
+        while i + 16 <= len {
+            let va = _mm512_loadu_ps(&a[i]);
+            let vb = _mm512_loadu_ps(&b[i]);
+            let vc = _mm512_mul_ps(va, vb);
+            _mm512_storeu_ps(&mut c[i], vc);
+            i += 16;
+        }
+        while i < len {
+            c[i] = a[i] * b[i];
+            i += 1;
+        }
+    }
+
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn mul_avx2(a: &[f32], b: &[f32], c: &mut [f32], len: usize) {
+        use std::arch::x86_64::*;
+        let mut i = 0;
+        while i + 8 <= len {
+            let va = _mm256_loadu_ps(&a[i]);
+            let vb = _mm256_loadu_ps(&b[i]);
+            let vc = _mm256_mul_ps(va, vb);
+            _mm256_storeu_ps(&mut c[i], vc);
+            i += 8;
+        }
+        while i < len {
+            c[i] = a[i] * b[i];
+            i += 1;
+        }
+    }
+
+    #[target_feature(enable = "avx")]
+    pub(super) unsafe fn mul_avx(a: &[f32], b: &[f32], c: &mut [f32], len: usize) {
+        use std::arch::x86_64::*;
+        let mut i = 0;
+        while i + 8 <= len {
+            let va = _mm256_loadu_ps(&a[i]);
+            let vb = _mm256_loadu_ps(&b[i]);
+            let vc = _mm256_mul_ps(va, vb);
+            _mm256_storeu_ps(&mut c[i], vc);
+            i += 8;
+        }
+        while i < len {
+            c[i] = a[i] * b[i];
+            i += 1;
+        }
+    }
+
+    #[target_feature(enable = "sse2")]
+    pub(super) unsafe fn mul_sse(a: &[f32], b: &[f32], c: &mut [f32], len: usize) {
+        use std::arch::x86_64::*;
+        let mut i = 0;
+        while i + 4 <= len {
+            let va = _mm_loadu_ps(&a[i]);
+            let vb = _mm_loadu_ps(&b[i]);
+            let vc = _mm_mul_ps(va, vb);
+            _mm_storeu_ps(&mut c[i], vc);
+            i += 4;
+        }
+        while i < len {
+            c[i] = a[i] * b[i];
+            i += 1;
+        }
+    }
+
+    #[target_feature(enable = "avx512f")]
+    pub(super) unsafe fn horizontal_sum_avx512(arr: &[f32], len: usize) -> f32 {
+        use std::arch::x86_64::*;
+        let mut sum = _mm512_setzero_ps();
+        let mut i = 0;
+        while i + 16 <= len {
+            sum = _mm512_add_ps(sum, _mm512_loadu_ps(&arr[i]));
+            i += 16;
+        }
+        let mut result = _mm512_reduce_add_ps(sum);
+        while i < len {
+            result += arr[i];
+            i += 1;
+        }
+        result
+    }
+
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn horizontal_sum_avx2(arr: &[f32], len: usize) -> f32 {
+        use std::arch::x86_64::*;
+        let mut sum = _mm256_setzero256();
+        let mut i = 0;
+        while i + 8 <= len {
+            sum = _mm256_add_ps(sum, _mm256_loadu_ps(&arr[i]));
+            i += 8;
+        }
+        // Horizontal add within 256-bit vector
+        let temp = _mm256_hadd_ps(sum, sum);
+        let temp = _mm256_hadd_ps(temp, temp);
+        let result = _mm256_cvtss_f32(_mm256_hadd_ps(temp, temp));
+        while i < len {
+            result += arr[i];
+            i += 1;
+        }
+        result
+    }
+
+    #[target_feature(enable = "sse2")]
+    pub(super) unsafe fn horizontal_sum_sse(arr: &[f32], len: usize) -> f32 {
+        use std::arch::x86_64::*;
+        let mut sum = _mm_setzero_ps();
+        let mut i = 0;
+        while i + 4 <= len {
+            sum = _mm_add_ps(sum, _mm_loadu_ps(&arr[i]));
+            i += 4;
+        }
+        // Horizontal add
+        let temp = _mm_hadd_ps(sum, sum);
+        let result = _mm_cvtss_f32(_mm_hadd_ps(temp, temp));
+        while i < len {
+            result += arr[i];
+            i += 1;
+        }
+        result
+    }
+
+    // GEMM implementations (simplified)
+    #[target_feature(enable = "avx512f")]
+    pub(super) unsafe fn gemm_avx512(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize) {
+        use std::arch::x86_64::*;
+        let nr = 16;
+        for m_idx in 0..m {
+            for n_idx in (0..n).step_by(nr) {
+                let n_end = (n_idx + nr).min(n);
+                let mut sum = [_mm512_setzero_ps(); 16];
+                let mut k_idx = 0;
+                while k_idx + 16 <= k {
+                    let a_val = _mm512_set1_ps(a[m_idx * k + k_idx]);
+                    for j in 0..16 {
+                        let b_val = _mm512_set1_ps(*b.get_unchecked((k_idx + j) * n + n_idx));
+                        sum[j] = _mm512_fmadd_ps(a_val, b_val, sum[j]);
+                    }
+                    k_idx += 16;
+                }
+                for j in 0..(n_end - n_idx) {
+                    let result = _mm512_reduce_add_ps(sum[j]);
+                    *c.get_unchecked_mut(m_idx * n + n_idx + j) += result;
+                }
+            }
+        }
+    }
+
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn gemm_avx2(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize) {
+        use std::arch::x86_64::*;
+        let nr = 8;
+        for m_idx in 0..m {
+            for n_idx in (0..n).step_by(nr) {
+                let n_end = (n_idx + nr).min(n);
+                let mut sum = [_mm256_setzero256(); 8];
+                let mut k_idx = 0;
+                while k_idx + 8 <= k {
+                    let a_val = _mm256_set1_ps(a[m_idx * k + k_idx]);
+                    for j in 0..8 {
+                        let b_val = _mm256_set1_ps(*b.get_unchecked((k_idx + j) * n + n_idx));
+                        sum[j] = _mm256_fmadd_ps(a_val, b_val, sum[j]);
+                    }
+                    k_idx += 8;
+                }
+                for j in 0..(n_end - n_idx) {
+                    let temp = _mm256_hadd_ps(sum[j], sum[j]);
+                    let temp = _mm256_hadd_ps(temp, temp);
+                    let result = _mm256_cvtss_f32(_mm256_hadd_ps(temp, temp));
+                    *c.get_unchecked_mut(m_idx * n + n_idx + j) += result;
+                }
+            }
+        }
+    }
+
+    #[target_feature(enable = "sse2")]
+    pub(super) unsafe fn gemm_sse(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize) {
+        use std::arch::x86_64::*;
+        let nr = 4;
+        for m_idx in 0..m {
+            for n_idx in (0..n).step_by(nr) {
+                let n_end = (n_idx + nr).min(n);
+                let mut sum = [_mm_setzero_ps(); 4];
+                let mut k_idx = 0;
+                while k_idx + 4 <= k {
+                    let a_val = _mm_set1_ps(a[m_idx * k + k_idx]);
+                    for j in 0..4 {
+                        let b_val = _mm_set1_ps(*b.get_unchecked((k_idx + j) * n + n_idx));
+                        sum[j] = _mm_add_ps(_mm_mul_ps(a_val, b_val), sum[j]);
+                    }
+                    k_idx += 4;
+                }
+                for j in 0..(n_end - n_idx) {
+                    let temp = _mm_hadd_ps(sum[j], sum[j]);
+                    let result = _mm_cvtss_f32(_mm_hadd_ps(temp, temp));
+                    *c.get_unchecked_mut(m_idx * n + n_idx + j) += result;
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// ARM64 NEON implementations
+// ============================================================================
+
+#[cfg(target_arch = "aarch64")]
+mod aarch64_impls {
+    use super::*;
+
+    #[target_feature(enable = "neon")]
+    pub(super) unsafe fn relu_neon(input: &[f32], output: &mut [f32], len: usize) {
+        use std::arch::aarch64::*;
+        let zero = vdupq_n_f32(0.0);
+        let mut i = 0;
+        while i + 4 <= len {
+            let data = vld1q_f32(&input[i]);
+            let result = vmaxq_f32(zero, data);
+            vst1q_f32(&mut output[i], result);
+            i += 4;
+        }
+        while i < len {
+            output[i] = if input[i] > 0.0 { input[i] } else { 0.0 };
+            i += 1;
+        }
+    }
+
+    #[target_feature(enable = "neon")]
+    pub(super) unsafe fn relu6_neon(input: &[f32], output: &mut [f32], len: usize) {
+        use std::arch::aarch64::*;
+        let zero = vdupq_n_f32(0.0);
+        let six = vdupq_n_f32(6.0);
+        let mut i = 0;
+        while i + 4 <= len {
+            let data = vld1q_f32(&input[i]);
+            let clamped = vminq_f32(vmaxq_f32(zero, data), six);
+            vst1q_f32(&mut output[i], clamped);
+            i += 4;
+        }
+        while i < len {
+            output[i] = input[i].clamp(0.0, 6.0);
+            i += 1;
+        }
+    }
+
+    #[target_feature(enable = "neon")]
+    pub(super) unsafe fn add_neon(a: &[f32], b: &[f32], c: &mut [f32], len: usize) {
+        use std::arch::aarch64::*;
+        let mut i = 0;
+        while i + 4 <= len {
+            let va = vld1q_f32(&a[i]);
+            let vb = vld1q_f32(&b[i]);
+            let vc = vaddq_f32(va, vb);
+            vst1q_f32(&mut c[i], vc);
+            i += 4;
+        }
+        while i < len {
+            c[i] = a[i] + b[i];
+            i += 1;
+        }
+    }
+
+    #[target_feature(enable = "neon")]
+    pub(super) unsafe fn mul_neon(a: &[f32], b: &[f32], c: &mut [f32], len: usize) {
+        use std::arch::aarch64::*;
+        let mut i = 0;
+        while i + 4 <= len {
+            let va = vld1q_f32(&a[i]);
+            let vb = vld1q_f32(&b[i]);
+            let vc = vmulq_f32(va, vb);
+            vst1q_f32(&mut c[i], vc);
+            i += 4;
+        }
+        while i < len {
+            c[i] = a[i] * b[i];
+            i += 1;
+        }
+    }
+
+    #[target_feature(enable = "neon")]
+    pub(super) unsafe fn horizontal_sum_neon(arr: &[f32], len: usize) -> f32 {
+        use std::arch::aarch64::*;
+        let mut sum = vdupq_n_f32(0.0);
+        let mut i = 0;
+        while i + 4 <= len {
+            let data = vld1q_f32(&arr[i]);
+            sum = vaddq_f32(sum, data);
+            i += 4;
+        }
+        // Extract lanes and add
+        let mut result = vgetq_lane_f32(sum, 0) + vgetq_lane_f32(sum, 1) +
+                         vgetq_lane_f32(sum, 2) + vgetq_lane_f32(sum, 3);
+        while i < len {
+            result += arr[i];
+            i += 1;
+        }
+        result
+    }
+
+    #[target_feature(enable = "neon")]
+    pub(super) unsafe fn gemm_neon(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize) {
+        use std::arch::aarch64::*;
+        for m_idx in 0..m {
+            for n_idx in 0..n {
+                let mut sum = 0.0f32;
+                let mut k_idx = 0;
+                while k_idx + 4 <= k {
+                    // Load 4 elements from A row
+                    let a_vec = vld1q_f32(a.as_ptr().add(m_idx * k + k_idx));
+                    // Load 4 elements from B column (stride n)
+                    let b0 = vld1q_f32(b.as_ptr().add(k_idx * n + n_idx));
+                    let b1 = vld1q_f32(b.as_ptr().add((k_idx + 1) * n + n_idx));
+                    let b2 = vld1q_f32(b.as_ptr().add((k_idx + 2) * n + n_idx));
+                    let b3 = vld1q_f32(b.as_ptr().add((k_idx + 3) * n + n_idx));
+                    // Expand a to match b
+                    let a0 = vdupq_n_f32(vgetq_lane_f32(a_vec, 0));
+                    let a1 = vdupq_n_f32(vgetq_lane_f32(a_vec, 1));
+                    let a2 = vdupq_n_f32(vgetq_lane_f32(a_vec, 2));
+                    let a3 = vdupq_n_f32(vgetq_lane_f32(a_vec, 3));
+                    // Multiply and accumulate
+                    sum += vgetq_lane_f32(vmulq_f32(a0, b0), 0);
+                    sum += vgetq_lane_f32(vmulq_f32(a1, b1), 0);
+                    sum += vgetq_lane_f32(vmulq_f32(a2, b2), 0);
+                    sum += vgetq_lane_f32(vmulq_f32(a3, b3), 0);
+                    k_idx += 4;
+                }
+                // Handle remaining elements
+                while k_idx < k {
+                    sum += a[m_idx * k + k_idx] * b[k_idx * n + n_idx];
+                    k_idx += 1;
+                }
+                c[m_idx * n + n_idx] += sum;
+            }
+        }
+    }
+}
+
+// Aliases for the parent module to use
+#[cfg(target_arch = "x86_64")]
+use x86_64_impls::*;
+#[cfg(target_arch = "aarch64")]
+use aarch64_impls::*;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_relu_simd() {
+        let input = vec![-3.0, -1.0, 0.0, 1.0, 2.0, 5.0, 7.0, 8.0];
+        let mut output = vec![0.0f32; 8];
+        let level = detect_simd_level();
+        relu_simd(&input, &mut output, level);
+        assert_eq!(output, vec![0.0, 0.0, 0.0, 1.0, 2.0, 5.0, 7.0, 8.0]);
+    }
+
+    #[test]
+    fn test_relu6_simd() {
+        let input = vec![-3.0, -1.0, 0.0, 1.0, 2.0, 5.0, 7.0, 8.0];
+        let mut output = vec![0.0f32; 8];
+        let level = detect_simd_level();
+        relu6_simd(&input, &mut output, level);
+        assert_eq!(output, vec![0.0, 0.0, 0.0, 1.0, 2.0, 5.0, 6.0, 6.0]);
+    }
+
+    #[test]
+    fn test_add_simd() {
+        let a = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let b = vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8];
+        let mut c = vec![0.0f32; 8];
+        let level = detect_simd_level();
+        add_simd(&a, &b, &mut c, level);
+        assert_eq!(c, vec![1.1, 2.2, 3.3, 4.4, 5.5, 6.6, 7.7, 8.8]);
+    }
+
+    #[test]
+    fn test_mul_simd() {
+        let a = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let b = vec![2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0];
+        let mut c = vec![0.0f32; 8];
+        let level = detect_simd_level();
+        mul_simd(&a, &b, &mut c, level);
+        assert_eq!(c, vec![2.0, 6.0, 12.0, 20.0, 30.0, 42.0, 56.0, 72.0]);
+    }
+
+    #[test]
+    fn test_gemm_simd() {
+        // A: 2x3, B: 3x2, C: 2x2
+        let a = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let b = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let mut c = vec![0.0f32; 4];
+        let level = detect_simd_level();
+        gemm_simd(&a, &b, &mut c, 2, 2, 3, level);
+        // C[0][0] = 1*1 + 2*3 + 3*5 = 22
+        // C[0][1] = 1*2 + 2*4 + 3*6 = 28
+        // C[1][0] = 4*1 + 5*3 + 6*5 = 49
+        // C[1][1] = 4*2 + 5*4 + 6*6 = 64
+        assert_eq!(c, vec![22.0, 28.0, 49.0, 64.0]);
+    }
+
+    #[test]
+    fn test_horizontal_sum() {
+        let arr = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let level = detect_simd_level();
+        let sum = horizontal_sum(&arr, level);
+        assert!((sum - 36.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_detect_simd_level() {
+        let level = detect_simd_level();
+        println!("Detected SIMD level: {:?}", level);
+        // On aarch64, should always detect Neon or better
+        #[cfg(target_arch = "aarch64")]
+        assert!(matches!(level, SimdLevel::Neon | SimdLevel::Neonfp16 | SimdLevel::None));
+        // On x86_64, should detect at least SSE2
+        #[cfg(target_arch = "x86_64")]
+        assert!(matches!(level, SimdLevel::Sse2 | SimdLevel::Sse3 | SimdLevel::Ssse3 |
+                                SimdLevel::Sse4_1 | SimdLevel::Sse4_2 | SimdLevel::Avx |
+                                SimdLevel::Avx2 | SimdLevel::Avx512 | SimdLevel::None));
+    }
+}
