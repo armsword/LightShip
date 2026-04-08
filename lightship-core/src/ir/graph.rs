@@ -2,7 +2,7 @@
 
 use super::operator::OperatorType;
 use super::tensor::Tensor;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 /// Node ID type
@@ -107,6 +107,51 @@ impl Graph {
     /// Get a node by ID
     pub fn node_by_id(&self, id: NodeId) -> Option<&Node> {
         self.nodes.get(id as usize)
+    }
+
+    /// Update node name in the index
+    pub fn update_node_name(&mut self, old_name: &str, new_name: String, node_id: NodeId) {
+        self.node_name_index.remove(old_name);
+        self.node_name_index.insert(new_name, node_id);
+    }
+
+    /// Remove a node by name, updating the index
+    pub fn remove_node(&mut self, name: &str) -> Option<Node> {
+        if let Some(&id) = self.node_name_index.get(name) {
+            self.node_name_index.remove(name);
+            if (id as usize) < self.nodes.len() {
+                let node = self.nodes.remove(id as usize);
+                // Reindex nodes after the removed one
+                for i in id as usize..self.nodes.len() {
+                    if let Some(node_name) = self.nodes.get(i).map(|n| n.name.clone()) {
+                        self.node_name_index.insert(node_name, i as NodeId);
+                    }
+                }
+                return Some(node);
+            }
+        }
+        None
+    }
+
+    /// Retain only nodes that match the predicate, updating the index
+    pub fn retain_nodes<F>(&mut self, mut pred: F)
+    where
+        F: FnMut(&Node) -> bool,
+    {
+        let names_to_retain: HashSet<String> = self
+            .nodes
+            .iter()
+            .filter(|n| pred(n))
+            .map(|n| n.name.clone())
+            .collect();
+
+        self.nodes.retain(|n| names_to_retain.contains(&n.name));
+
+        // Rebuild the index
+        self.node_name_index.clear();
+        for (i, node) in self.nodes.iter().enumerate() {
+            self.node_name_index.insert(node.name.clone(), i as NodeId);
+        }
     }
 
     /// Perform topological sort on the graph

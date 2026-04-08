@@ -8,9 +8,11 @@ pub mod graph;
 pub mod operator;
 pub mod attribute;
 pub mod fusion;
+pub mod optimizer;
 
 pub use tensor::{Tensor, TensorData, TensorShape};
 pub use graph::{Graph, Node, NodeId, NodeIO};
 pub use operator::{OperatorDef, OperatorType};
 pub use attribute::{Attribute, AttributeMap, AttributeValue};
 pub use fusion::{FusionInfo, FusionType};
+pub use optimizer::{ConstantFolding, DeadCodeElimination, NodeReplacement, ShapeInference};
