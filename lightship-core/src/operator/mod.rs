@@ -8,9 +8,11 @@ mod softmax;
 mod layernorm;
 mod gelu;
 mod attention;
+mod convolution;
 
 pub use matmul::MatMul;
 pub use softmax::Softmax;
 pub use layernorm::LayerNorm;
 pub use gelu::Gelu;
 pub use attention::{SelfAttention, MultiHeadAttention, SkipConnection};
+pub use convolution::{Conv2d, Conv2dConfig};

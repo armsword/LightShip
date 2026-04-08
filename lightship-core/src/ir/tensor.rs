@@ -91,4 +91,31 @@ impl Tensor {
     pub fn is_quantized(&self) -> bool {
         self.quantization.is_some()
     }
+
+    /// Get tensor data as byte slice
+    pub fn data_as_bytes(&self) -> &[u8] {
+        match &self.data {
+            TensorData::Empty => &[],
+            TensorData::Owned(v) => v,
+            TensorData::Shared(v) => v,
+        }
+    }
+
+    /// Create tensor with owned data
+    pub fn from_data(name: String, shape: TensorShape, data_type: DataType, data: Vec<f32>) -> Self {
+        let byte_size = data.len() * 4;
+        let mut bytes = Vec::with_capacity(byte_size);
+        for f in data {
+            bytes.extend_from_slice(&f.to_le_bytes());
+        }
+        Self {
+            name,
+            shape,
+            data_type,
+            layout: StorageLayout::NCHW,
+            data: TensorData::Owned(bytes),
+            quantization: None,
+            lifetime: TensorLifetime::Temporary,
+        }
+    }
 }
