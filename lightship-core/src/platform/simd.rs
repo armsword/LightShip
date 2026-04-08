@@ -194,6 +194,72 @@ pub fn mul_simd(a: &[f32], b: &[f32], c: &mut [f32], level: SimdLevel) {
     mul_scalar(a, b, c, len);
 }
 
+/// Compute exp(x) for each element (softmax use)
+pub fn exp_simd(input: &[f32], output: &mut [f32], level: SimdLevel) {
+    let len = input.len().min(output.len());
+    #[cfg(target_arch = "x86_64")]
+    {
+        match level {
+            SimdLevel::Avx512 => { unsafe { exp_avx512(input, output, len) }; return; }
+            SimdLevel::Avx2 => { unsafe { exp_avx2(input, output, len) }; return; }
+            SimdLevel::Avx | SimdLevel::Sse2 | SimdLevel::Neon => { unsafe { exp_sse(input, output, len) }; return; }
+            _ => {}
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if matches!(level, SimdLevel::Neon | SimdLevel::Neonfp16) {
+            unsafe { exp_neon(input, output, len) };
+            return;
+        }
+    }
+    exp_scalar(input, output, len);
+}
+
+/// Subtract scalar from each element: output = input - scalar
+pub fn sub_scalar_simd(input: &[f32], output: &mut [f32], scalar: f32, level: SimdLevel) {
+    let len = input.len().min(output.len());
+    #[cfg(target_arch = "x86_64")]
+    {
+        match level {
+            SimdLevel::Avx512 => { unsafe { sub_scalar_avx512(input, output, scalar, len) }; return; }
+            SimdLevel::Avx2 => { unsafe { sub_scalar_avx2(input, output, scalar, len) }; return; }
+            SimdLevel::Avx | SimdLevel::Sse2 | SimdLevel::Neon => { unsafe { sub_scalar_sse(input, output, scalar, len) }; return; }
+            _ => {}
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if matches!(level, SimdLevel::Neon | SimdLevel::Neonfp16) {
+            unsafe { sub_scalar_neon(input, output, scalar, len) };
+            return;
+        }
+    }
+    sub_scalar_scalar(input, output, scalar, len);
+}
+
+/// Divide by scalar: output = input / scalar
+pub fn div_scalar_simd(input: &[f32], output: &mut [f32], scalar: f32, level: SimdLevel) {
+    let len = input.len().min(output.len());
+    #[cfg(target_arch = "x86_64")]
+    {
+        match level {
+            SimdLevel::Avx512 => { unsafe { div_scalar_avx512(input, output, scalar, len) }; return; }
+            SimdLevel::Avx2 => { unsafe { div_scalar_avx2(input, output, scalar, len) }; return; }
+            SimdLevel::Avx | SimdLevel::Sse2 | SimdLevel::Neon => { unsafe { div_scalar_sse(input, output, scalar, len) }; return; }
+            _ => {}
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if matches!(level, SimdLevel::Neon | SimdLevel::Neonfp16) {
+            unsafe { div_scalar_neon(input, output, scalar, len) };
+            return;
+        }
+    }
+    div_scalar_scalar(input, output, scalar, len);
+}
+
 /// GEMM: C = A * B + C
 /// - A: [M x K], B: [K x N], C: [M x N]
 pub fn gemm_simd(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize, level: SimdLevel) {
@@ -279,6 +345,24 @@ fn gemm_scalar(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize
 
 fn horizontal_sum_scalar(arr: &[f32], len: usize) -> f32 {
     arr.iter().sum()
+}
+
+fn exp_scalar(input: &[f32], output: &mut [f32], len: usize) {
+    for i in 0..len {
+        output[i] = input[i].exp();
+    }
+}
+
+fn sub_scalar_scalar(input: &[f32], output: &mut [f32], scalar: f32, len: usize) {
+    for i in 0..len {
+        output[i] = input[i] - scalar;
+    }
+}
+
+fn div_scalar_scalar(input: &[f32], output: &mut [f32], scalar: f32, len: usize) {
+    for i in 0..len {
+        output[i] = input[i] / scalar;
+    }
 }
 
 // ============================================================================
@@ -699,6 +783,206 @@ mod x86_64_impls {
             }
         }
     }
+
+    // exp implementation using polynomial approximation
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn exp_avx2(input: &[f32], output: &mut [f32], len: usize) {
+        use std::arch::x86_64::*;
+        let mut i = 0;
+        while i + 8 <= len {
+            let x = _mm256_loadu_ps(&input[i]);
+            // exp(x) approximation using AVX2
+            // exp(x) = exp(x - 127) * 2^127 where we use exp(x) ~ poly
+            let exp_x = exp_poly_avx2(x);
+            _mm256_storeu_ps(&mut output[i], exp_x);
+            i += 8;
+        }
+        while i < len {
+            output[i] = input[i].exp();
+            i += 1;
+        }
+    }
+
+    #[target_feature(enable = "avx2")]
+    unsafe fn exp_poly_avx2(x: __m256) -> __m256 {
+        use std::arch::x86_64::*;
+        // Polynomial coefficients for exp approximation
+        // Using the approximation: exp(x) ≈ 1 + x + x^2/2! + x^3/3! + x^4/4!
+        let one = _mm256_set1_ps(1.0);
+        let x2 = _mm256_mul_ps(x, x);
+        let x3 = _mm256_mul_ps(x2, x);
+        let x4 = _mm256_mul_ps(x3, x);
+        let result = _mm256_add_ps(one,
+            _mm256_add_ps(x,
+            _mm256_add_ps(_mm256_mul_ps(_mm256_set1_ps(0.5), x2),
+            _mm256_add_ps(_mm256_mul_ps(_mm256_set1_ps(1.0/6.0), x3),
+                          _mm256_mul_ps(_mm256_set1_ps(1.0/24.0), x4)))));
+        result
+    }
+
+    #[target_feature(enable = "sse2")]
+    pub(super) unsafe fn exp_sse(input: &[f32], output: &mut [f32], len: usize) {
+        use std::arch::x86_64::*;
+        let mut i = 0;
+        while i + 4 <= len {
+            let x = _mm_loadu_ps(&input[i]);
+            let exp_x = exp_poly_sse(x);
+            _mm_storeu_ps(&mut output[i], exp_x);
+            i += 4;
+        }
+        while i < len {
+            output[i] = input[i].exp();
+            i += 1;
+        }
+    }
+
+    #[target_feature(enable = "sse2")]
+    unsafe fn exp_poly_sse(x: __m128) -> __m128 {
+        use std::arch::x86_64::*;
+        let one = _mm_set1_ps(1.0);
+        let x2 = _mm_mul_ps(x, x);
+        let x3 = _mm_mul_ps(x2, x);
+        let x4 = _mm_mul_ps(x3, x);
+        _mm_add_ps(one,
+            _mm_add_ps(x,
+            _mm_add_ps(_mm_mul_ps(_mm_set1_ps(0.5), x2),
+            _mm_add_ps(_mm_mul_ps(_mm_set1_ps(1.0/6.0), x3),
+                          _mm_mul_ps(_mm_set1_ps(1.0/24.0), x4)))))
+    }
+
+    #[target_feature(enable = "avx512f")]
+    pub(super) unsafe fn exp_avx512(input: &[f32], output: &mut [f32], len: usize) {
+        use std::arch::x86_64::*;
+        let mut i = 0;
+        while i + 16 <= len {
+            let x = _mm512_loadu_ps(&input[i]);
+            let exp_x = exp_poly_avx512(x);
+            _mm512_storeu_ps(&mut output[i], exp_x);
+            i += 16;
+        }
+        while i < len {
+            output[i] = input[i].exp();
+            i += 1;
+        }
+    }
+
+    #[target_feature(enable = "avx512f")]
+    unsafe fn exp_poly_avx512(x: __m512) -> __m512 {
+        use std::arch::x86_64::*;
+        let one = _mm512_set1_ps(1.0);
+        let x2 = _mm512_mul_ps(x, x);
+        let x3 = _mm512_mul_ps(x2, x);
+        let x4 = _mm512_mul_ps(x3, x);
+        let t1 = _mm512_mul_ps(_mm512_set1_ps(0.5), x2);
+        let t2 = _mm512_mul_ps(_mm512_set1_ps(1.0 / 6.0), x3);
+        let t3 = _mm512_mul_ps(_mm512_set1_ps(1.0 / 24.0), x4);
+        let inner = _mm512_add_ps(t2, t3);
+        let mid = _mm512_add_ps(t1, inner);
+        let result = _mm512_add_ps(_mm512_add_ps(one, x), mid);
+        result
+    }
+
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn sub_scalar_avx2(input: &[f32], output: &mut [f32], scalar: f32, len: usize) {
+        use std::arch::x86_64::*;
+        let scalar_vec = _mm256_set1_ps(scalar);
+        let mut i = 0;
+        while i + 8 <= len {
+            let x = _mm256_loadu_ps(&input[i]);
+            let result = _mm256_sub_ps(x, scalar_vec);
+            _mm256_storeu_ps(&mut output[i], result);
+            i += 8;
+        }
+        while i < len {
+            output[i] = input[i] - scalar;
+            i += 1;
+        }
+    }
+
+    #[target_feature(enable = "sse2")]
+    pub(super) unsafe fn sub_scalar_sse(input: &[f32], output: &mut [f32], scalar: f32, len: usize) {
+        use std::arch::x86_64::*;
+        let scalar_vec = _mm_set1_ps(scalar);
+        let mut i = 0;
+        while i + 4 <= len {
+            let x = _mm_loadu_ps(&input[i]);
+            let result = _mm_sub_ps(x, scalar_vec);
+            _mm_storeu_ps(&mut output[i], result);
+            i += 4;
+        }
+        while i < len {
+            output[i] = input[i] - scalar;
+            i += 1;
+        }
+    }
+
+    #[target_feature(enable = "avx512f")]
+    pub(super) unsafe fn sub_scalar_avx512(input: &[f32], output: &mut [f32], scalar: f32, len: usize) {
+        use std::arch::x86_64::*;
+        let scalar_vec = _mm512_set1_ps(scalar);
+        let mut i = 0;
+        while i + 16 <= len {
+            let x = _mm512_loadu_ps(&input[i]);
+            let result = _mm512_sub_ps(x, scalar_vec);
+            _mm512_storeu_ps(&mut output[i], result);
+            i += 16;
+        }
+        while i < len {
+            output[i] = input[i] - scalar;
+            i += 1;
+        }
+    }
+
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn div_scalar_avx2(input: &[f32], output: &mut [f32], scalar: f32, len: usize) {
+        use std::arch::x86_64::*;
+        let scalar_vec = _mm256_set1_ps(scalar);
+        let mut i = 0;
+        while i + 8 <= len {
+            let x = _mm256_loadu_ps(&input[i]);
+            let result = _mm256_div_ps(x, scalar_vec);
+            _mm256_storeu_ps(&mut output[i], result);
+            i += 8;
+        }
+        while i < len {
+            output[i] = input[i] / scalar;
+            i += 1;
+        }
+    }
+
+    #[target_feature(enable = "sse2")]
+    pub(super) unsafe fn div_scalar_sse(input: &[f32], output: &mut [f32], scalar: f32, len: usize) {
+        use std::arch::x86_64::*;
+        let scalar_vec = _mm_set1_ps(scalar);
+        let mut i = 0;
+        while i + 4 <= len {
+            let x = _mm_loadu_ps(&input[i]);
+            let result = _mm_div_ps(x, scalar_vec);
+            _mm_storeu_ps(&mut output[i], result);
+            i += 4;
+        }
+        while i < len {
+            output[i] = input[i] / scalar;
+            i += 1;
+        }
+    }
+
+    #[target_feature(enable = "avx512f")]
+    pub(super) unsafe fn div_scalar_avx512(input: &[f32], output: &mut [f32], scalar: f32, len: usize) {
+        use std::arch::x86_64::*;
+        let scalar_vec = _mm512_set1_ps(scalar);
+        let mut i = 0;
+        while i + 16 <= len {
+            let x = _mm512_loadu_ps(&input[i]);
+            let result = _mm512_div_ps(x, scalar_vec);
+            _mm512_storeu_ps(&mut output[i], result);
+            i += 16;
+        }
+        while i < len {
+            output[i] = input[i] / scalar;
+            i += 1;
+        }
+    }
 }
 
 // ============================================================================
@@ -832,6 +1116,68 @@ mod aarch64_impls {
                 }
                 c[m_idx * n + n_idx] += sum;
             }
+        }
+    }
+
+    #[target_feature(enable = "neon")]
+    pub(super) unsafe fn exp_neon(input: &[f32], output: &mut [f32], len: usize) {
+        use std::arch::aarch64::*;
+        let mut i = 0;
+        while i + 4 <= len {
+            let x = vld1q_f32(&input[i]);
+            // exp(x) approximation using polynomial: 1 + x + x^2/2! + x^3/3! + x^4/4!
+            let x2 = vmulq_f32(x, x);
+            let x3 = vmulq_f32(x2, x);
+            let x4 = vmulq_f32(x3, x);
+            let one = vdupq_n_f32(1.0);
+            let half = vdupq_n_f32(0.5);
+            let sixth = vdupq_n_f32(1.0 / 6.0);
+            let twenty_fourth = vdupq_n_f32(1.0 / 24.0);
+            let result = vaddq_f32(one,
+                vaddq_f32(x,
+                    vaddq_f32(vmulq_f32(half, x2),
+                        vaddq_f32(vmulq_f32(sixth, x3),
+                                  vmulq_f32(twenty_fourth, x4)))));
+            vst1q_f32(&mut output[i], result);
+            i += 4;
+        }
+        while i < len {
+            output[i] = input[i].exp();
+            i += 1;
+        }
+    }
+
+    #[target_feature(enable = "neon")]
+    pub(super) unsafe fn sub_scalar_neon(input: &[f32], output: &mut [f32], scalar: f32, len: usize) {
+        use std::arch::aarch64::*;
+        let scalar_vec = vdupq_n_f32(scalar);
+        let mut i = 0;
+        while i + 4 <= len {
+            let x = vld1q_f32(&input[i]);
+            let result = vsubq_f32(x, scalar_vec);
+            vst1q_f32(&mut output[i], result);
+            i += 4;
+        }
+        while i < len {
+            output[i] = input[i] - scalar;
+            i += 1;
+        }
+    }
+
+    #[target_feature(enable = "neon")]
+    pub(super) unsafe fn div_scalar_neon(input: &[f32], output: &mut [f32], scalar: f32, len: usize) {
+        use std::arch::aarch64::*;
+        let scalar_vec = vdupq_n_f32(scalar);
+        let mut i = 0;
+        while i + 4 <= len {
+            let x = vld1q_f32(&input[i]);
+            let result = vdivq_f32(x, scalar_vec);
+            vst1q_f32(&mut output[i], result);
+            i += 4;
+        }
+        while i < len {
+            output[i] = input[i] / scalar;
+            i += 1;
         }
     }
 }
