@@ -260,6 +260,28 @@ pub fn div_scalar_simd(input: &[f32], output: &mut [f32], scalar: f32, level: Si
     div_scalar_scalar(input, output, scalar, len);
 }
 
+/// Multiply by scalar: output = input * scalar
+pub fn mul_scalar_simd(input: &[f32], output: &mut [f32], scalar: f32, level: SimdLevel) {
+    let len = input.len().min(output.len());
+    #[cfg(target_arch = "x86_64")]
+    {
+        match level {
+            SimdLevel::Avx512 => { unsafe { mul_scalar_avx512(input, output, scalar, len) }; return; }
+            SimdLevel::Avx2 => { unsafe { mul_scalar_avx2(input, output, scalar, len) }; return; }
+            SimdLevel::Avx | SimdLevel::Sse2 | SimdLevel::Neon => { unsafe { mul_scalar_sse(input, output, scalar, len) }; return; }
+            _ => {}
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if matches!(level, SimdLevel::Neon | SimdLevel::Neonfp16) {
+            unsafe { mul_scalar_neon(input, output, scalar, len) };
+            return;
+        }
+    }
+    mul_scalar_scalar(input, output, scalar, len);
+}
+
 /// GEMM: C = A * B + C
 /// - A: [M x K], B: [K x N], C: [M x N]
 pub fn gemm_simd(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize, level: SimdLevel) {
@@ -362,6 +384,12 @@ fn sub_scalar_scalar(input: &[f32], output: &mut [f32], scalar: f32, len: usize)
 fn div_scalar_scalar(input: &[f32], output: &mut [f32], scalar: f32, len: usize) {
     for i in 0..len {
         output[i] = input[i] / scalar;
+    }
+}
+
+fn mul_scalar_scalar(input: &[f32], output: &mut [f32], scalar: f32, len: usize) {
+    for i in 0..len {
+        output[i] = input[i] * scalar;
     }
 }
 
@@ -1019,6 +1047,57 @@ mod x86_64_impls {
             i += 1;
         }
     }
+
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn mul_scalar_avx2(input: &[f32], output: &mut [f32], scalar: f32, len: usize) {
+        use std::arch::x86_64::*;
+        let scalar_vec = _mm256_set1_ps(scalar);
+        let mut i = 0;
+        while i + 8 <= len {
+            let x = _mm256_loadu_ps(&input[i]);
+            let result = _mm256_mul_ps(x, scalar_vec);
+            _mm256_storeu_ps(&mut output[i], result);
+            i += 8;
+        }
+        while i < len {
+            output[i] = input[i] * scalar;
+            i += 1;
+        }
+    }
+
+    #[target_feature(enable = "sse2")]
+    pub(super) unsafe fn mul_scalar_sse(input: &[f32], output: &mut [f32], scalar: f32, len: usize) {
+        use std::arch::x86_64::*;
+        let scalar_vec = _mm_set1_ps(scalar);
+        let mut i = 0;
+        while i + 4 <= len {
+            let x = _mm_loadu_ps(&input[i]);
+            let result = _mm_mul_ps(x, scalar_vec);
+            _mm_storeu_ps(&mut output[i], result);
+            i += 4;
+        }
+        while i < len {
+            output[i] = input[i] * scalar;
+            i += 1;
+        }
+    }
+
+    #[target_feature(enable = "avx512f")]
+    pub(super) unsafe fn mul_scalar_avx512(input: &[f32], output: &mut [f32], scalar: f32, len: usize) {
+        use std::arch::x86_64::*;
+        let scalar_vec = _mm512_set1_ps(scalar);
+        let mut i = 0;
+        while i + 16 <= len {
+            let x = _mm512_loadu_ps(&input[i]);
+            let result = _mm512_mul_ps(x, scalar_vec);
+            _mm512_storeu_ps(&mut output[i], result);
+            i += 16;
+        }
+        while i < len {
+            output[i] = input[i] * scalar;
+            i += 1;
+        }
+    }
 }
 
 // ============================================================================
@@ -1205,6 +1284,23 @@ mod aarch64_impls {
         }
         while i < len {
             output[i] = input[i] / scalar;
+            i += 1;
+        }
+    }
+
+    #[target_feature(enable = "neon")]
+    pub(super) unsafe fn mul_scalar_neon(input: &[f32], output: &mut [f32], scalar: f32, len: usize) {
+        use std::arch::aarch64::*;
+        let scalar_vec = vdupq_n_f32(scalar);
+        let mut i = 0;
+        while i + 4 <= len {
+            let x = vld1q_f32(&input[i]);
+            let result = vmulq_f32(x, scalar_vec);
+            vst1q_f32(&mut output[i], result);
+            i += 4;
+        }
+        while i < len {
+            output[i] = input[i] * scalar;
             i += 1;
         }
     }
