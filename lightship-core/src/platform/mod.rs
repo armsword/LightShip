@@ -11,4 +11,5 @@ pub use cpu_info::CpuInfo;
 pub use simd::{
     SimdLevel, SimdOp, detect_simd_level,
     relu_simd, relu6_simd, add_simd, mul_simd, gemm_simd, horizontal_sum,
+    exp_simd, sub_scalar_simd, div_scalar_simd,
 };

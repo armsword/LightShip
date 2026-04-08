@@ -790,11 +790,16 @@ mod x86_64_impls {
         use std::arch::x86_64::*;
         let mut i = 0;
         while i + 8 <= len {
-            let x = _mm256_loadu_ps(&input[i]);
-            // exp(x) approximation using AVX2
-            // exp(x) = exp(x - 127) * 2^127 where we use exp(x) ~ poly
-            let exp_x = exp_poly_avx2(x);
-            _mm256_storeu_ps(&mut output[i], exp_x);
+            let x0 = input[i].exp();
+            let x1 = input[i + 1].exp();
+            let x2 = input[i + 2].exp();
+            let x3 = input[i + 3].exp();
+            let x4 = input[i + 4].exp();
+            let x5 = input[i + 5].exp();
+            let x6 = input[i + 6].exp();
+            let x7 = input[i + 7].exp();
+            let vec = _mm256_set_ps(x7, x6, x5, x4, x3, x2, x1, x0);
+            _mm256_storeu_ps(&mut output[i], vec);
             i += 8;
         }
         while i < len {
@@ -803,31 +808,17 @@ mod x86_64_impls {
         }
     }
 
-    #[target_feature(enable = "avx2")]
-    unsafe fn exp_poly_avx2(x: __m256) -> __m256 {
-        use std::arch::x86_64::*;
-        // Polynomial coefficients for exp approximation
-        // Using the approximation: exp(x) ≈ 1 + x + x^2/2! + x^3/3! + x^4/4!
-        let one = _mm256_set1_ps(1.0);
-        let x2 = _mm256_mul_ps(x, x);
-        let x3 = _mm256_mul_ps(x2, x);
-        let x4 = _mm256_mul_ps(x3, x);
-        let result = _mm256_add_ps(one,
-            _mm256_add_ps(x,
-            _mm256_add_ps(_mm256_mul_ps(_mm256_set1_ps(0.5), x2),
-            _mm256_add_ps(_mm256_mul_ps(_mm256_set1_ps(1.0/6.0), x3),
-                          _mm256_mul_ps(_mm256_set1_ps(1.0/24.0), x4)))));
-        result
-    }
-
     #[target_feature(enable = "sse2")]
     pub(super) unsafe fn exp_sse(input: &[f32], output: &mut [f32], len: usize) {
         use std::arch::x86_64::*;
         let mut i = 0;
         while i + 4 <= len {
-            let x = _mm_loadu_ps(&input[i]);
-            let exp_x = exp_poly_sse(x);
-            _mm_storeu_ps(&mut output[i], exp_x);
+            let x0 = input[i].exp();
+            let x1 = input[i + 1].exp();
+            let x2 = input[i + 2].exp();
+            let x3 = input[i + 3].exp();
+            let vec = _mm_set_ps(x3, x2, x1, x0);
+            _mm_storeu_ps(&mut output[i], vec);
             i += 4;
         }
         while i < len {
@@ -839,15 +830,30 @@ mod x86_64_impls {
     #[target_feature(enable = "sse2")]
     unsafe fn exp_poly_sse(x: __m128) -> __m128 {
         use std::arch::x86_64::*;
+        // 8th-order polynomial for better accuracy
         let one = _mm_set1_ps(1.0);
         let x2 = _mm_mul_ps(x, x);
         let x3 = _mm_mul_ps(x2, x);
         let x4 = _mm_mul_ps(x3, x);
-        _mm_add_ps(one,
-            _mm_add_ps(x,
-            _mm_add_ps(_mm_mul_ps(_mm_set1_ps(0.5), x2),
-            _mm_add_ps(_mm_mul_ps(_mm_set1_ps(1.0/6.0), x3),
-                          _mm_mul_ps(_mm_set1_ps(1.0/24.0), x4)))))
+        let x5 = _mm_mul_ps(x4, x);
+        let x6 = _mm_mul_ps(x5, x);
+        let x7 = _mm_mul_ps(x6, x);
+        let x8 = _mm_mul_ps(x7, x);
+        let t1 = _mm_mul_ps(_mm_set1_ps(0.5), x2);
+        let t2 = _mm_mul_ps(_mm_set1_ps(1.0 / 6.0), x3);
+        let t3 = _mm_mul_ps(_mm_set1_ps(1.0 / 24.0), x4);
+        let t4 = _mm_mul_ps(_mm_set1_ps(1.0 / 120.0), x5);
+        let t5 = _mm_mul_ps(_mm_set1_ps(1.0 / 720.0), x6);
+        let t6 = _mm_mul_ps(_mm_set1_ps(1.0 / 5040.0), x7);
+        let t7 = _mm_mul_ps(_mm_set1_ps(1.0 / 40320.0), x8);
+        let s1 = _mm_add_ps(t1, t2);
+        let s2 = _mm_add_ps(t3, t4);
+        let s3 = _mm_add_ps(t5, t6);
+        let s4 = _mm_add_ps(s1, s2);
+        let s5 = _mm_add_ps(s3, s4);
+        let s6 = _mm_add_ps(s5, t7);
+        let result = _mm_add_ps(_mm_add_ps(one, x), s6);
+        result
     }
 
     #[target_feature(enable = "avx512f")]
@@ -855,9 +861,26 @@ mod x86_64_impls {
         use std::arch::x86_64::*;
         let mut i = 0;
         while i + 16 <= len {
-            let x = _mm512_loadu_ps(&input[i]);
-            let exp_x = exp_poly_avx512(x);
-            _mm512_storeu_ps(&mut output[i], exp_x);
+            // Use scalar exp for accuracy (SSE/AVX polynomial approximation not accurate enough)
+            let x0 = input[i].exp();
+            let x1 = input[i + 1].exp();
+            let x2 = input[i + 2].exp();
+            let x3 = input[i + 3].exp();
+            let x4 = input[i + 4].exp();
+            let x5 = input[i + 5].exp();
+            let x6 = input[i + 6].exp();
+            let x7 = input[i + 7].exp();
+            let x8 = input[i + 8].exp();
+            let x9 = input[i + 9].exp();
+            let x10 = input[i + 10].exp();
+            let x11 = input[i + 11].exp();
+            let x12 = input[i + 12].exp();
+            let x13 = input[i + 13].exp();
+            let x14 = input[i + 14].exp();
+            let x15 = input[i + 15].exp();
+            let vec = _mm512_set_ps(x15, x14, x13, x12, x11, x10, x9, x8,
+                                    x7, x6, x5, x4, x3, x2, x1, x0);
+            _mm512_storeu_ps(&mut output[i], vec);
             i += 16;
         }
         while i < len {
@@ -869,16 +892,29 @@ mod x86_64_impls {
     #[target_feature(enable = "avx512f")]
     unsafe fn exp_poly_avx512(x: __m512) -> __m512 {
         use std::arch::x86_64::*;
+        // 8th-order polynomial for better accuracy
         let one = _mm512_set1_ps(1.0);
         let x2 = _mm512_mul_ps(x, x);
         let x3 = _mm512_mul_ps(x2, x);
         let x4 = _mm512_mul_ps(x3, x);
+        let x5 = _mm512_mul_ps(x4, x);
+        let x6 = _mm512_mul_ps(x5, x);
+        let x7 = _mm512_mul_ps(x6, x);
+        let x8 = _mm512_mul_ps(x7, x);
         let t1 = _mm512_mul_ps(_mm512_set1_ps(0.5), x2);
         let t2 = _mm512_mul_ps(_mm512_set1_ps(1.0 / 6.0), x3);
         let t3 = _mm512_mul_ps(_mm512_set1_ps(1.0 / 24.0), x4);
-        let inner = _mm512_add_ps(t2, t3);
-        let mid = _mm512_add_ps(t1, inner);
-        let result = _mm512_add_ps(_mm512_add_ps(one, x), mid);
+        let t4 = _mm512_mul_ps(_mm512_set1_ps(1.0 / 120.0), x5);
+        let t5 = _mm512_mul_ps(_mm512_set1_ps(1.0 / 720.0), x6);
+        let t6 = _mm512_mul_ps(_mm512_set1_ps(1.0 / 5040.0), x7);
+        let t7 = _mm512_mul_ps(_mm512_set1_ps(1.0 / 40320.0), x8);
+        let s1 = _mm512_add_ps(t1, t2);
+        let s2 = _mm512_add_ps(t3, t4);
+        let s3 = _mm512_add_ps(t5, t6);
+        let s4 = _mm512_add_ps(s1, s2);
+        let s5 = _mm512_add_ps(s3, s4);
+        let s6 = _mm512_add_ps(s5, t7);
+        let result = _mm512_add_ps(_mm512_add_ps(one, x), s6);
         result
     }
 
@@ -1124,20 +1160,12 @@ mod aarch64_impls {
         use std::arch::aarch64::*;
         let mut i = 0;
         while i + 4 <= len {
-            let x = vld1q_f32(&input[i]);
-            // exp(x) approximation using polynomial: 1 + x + x^2/2! + x^3/3! + x^4/4!
-            let x2 = vmulq_f32(x, x);
-            let x3 = vmulq_f32(x2, x);
-            let x4 = vmulq_f32(x3, x);
-            let one = vdupq_n_f32(1.0);
-            let half = vdupq_n_f32(0.5);
-            let sixth = vdupq_n_f32(1.0 / 6.0);
-            let twenty_fourth = vdupq_n_f32(1.0 / 24.0);
-            let result = vaddq_f32(one,
-                vaddq_f32(x,
-                    vaddq_f32(vmulq_f32(half, x2),
-                        vaddq_f32(vmulq_f32(sixth, x3),
-                                  vmulq_f32(twenty_fourth, x4)))));
+            // Load 4 floats and compute exp using scalar (NEON doesn't have exp intrinsic)
+            let mut vals = [0.0f32; 4];
+            for j in 0..4 {
+                vals[j] = input[i + j].exp();
+            }
+            let result = vld1q_f32(vals.as_ptr());
             vst1q_f32(&mut output[i], result);
             i += 4;
         }

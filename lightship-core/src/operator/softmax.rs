@@ -3,6 +3,7 @@
 //! Implements softmax normalization for multi-class classification.
 
 use crate::ir::Tensor;
+use crate::platform::{detect_simd_level, div_scalar_simd, exp_simd, horizontal_sum, sub_scalar_simd, SimdLevel};
 use std::fmt;
 
 /// Softmax operator result
@@ -45,6 +46,8 @@ pub struct Softmax {
     pub axis: SoftmaxAxis,
     /// Number of elements to process (for partial softmax)
     pub num_elements: Option<usize>,
+    /// SIMD acceleration level
+    simd_level: SimdLevel,
 }
 
 impl Softmax {
@@ -53,6 +56,7 @@ impl Softmax {
         Self {
             axis: SoftmaxAxis::default(),
             num_elements: None,
+            simd_level: detect_simd_level(),
         }
     }
 
@@ -61,6 +65,7 @@ impl Softmax {
         Self {
             axis: SoftmaxAxis::Last,
             num_elements: None,
+            simd_level: detect_simd_level(),
         }
     }
 
@@ -69,6 +74,7 @@ impl Softmax {
         Self {
             axis: SoftmaxAxis::First,
             num_elements: None,
+            simd_level: detect_simd_level(),
         }
     }
 
@@ -77,6 +83,16 @@ impl Softmax {
         Self {
             axis: SoftmaxAxis::Axis(axis),
             num_elements: None,
+            simd_level: detect_simd_level(),
+        }
+    }
+
+    /// Create Softmax with specified SIMD level (for testing)
+    pub fn with_simd_level(axis: SoftmaxAxis, simd_level: SimdLevel) -> Self {
+        Self {
+            axis,
+            num_elements: None,
+            simd_level,
         }
     }
 
@@ -101,6 +117,30 @@ impl Softmax {
         (max_val, exp_sum)
     }
 
+    /// SIMD-accelerated version of compute_sum_exp
+    /// Returns the sum of exponentials for numerical stability
+    pub fn compute_sum_exp_simd(&self, data: &[f32]) -> (f32, f32) {
+        if data.is_empty() {
+            return (0.0, 0.0);
+        }
+
+        // Find max for numerical stability (scalar, as SIMD reduction for max is complex)
+        let max_val = data.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+
+        // Compute exp(x - max) for each element using SIMD
+        // Step 1: sub_scalar into temp1
+        let mut temp1 = vec![0.0f32; data.len()];
+        sub_scalar_simd(data, &mut temp1, max_val, self.simd_level);
+        // Step 2: exp into temp2 (need separate buffer)
+        let mut temp2 = vec![0.0f32; data.len()];
+        exp_simd(&temp1, &mut temp2, self.simd_level);
+
+        // Sum exponentials using SIMD horizontal sum
+        let exp_sum = horizontal_sum(&temp2, self.simd_level);
+
+        (max_val, exp_sum)
+    }
+
     /// Compute softmax on a slice of data
     pub fn compute(data: &mut [f32]) {
         if data.is_empty() {
@@ -114,6 +154,30 @@ impl Softmax {
             for x in data.iter_mut() {
                 *x = ((*x - max_val).exp()) * scale;
             }
+        }
+    }
+
+    /// SIMD-accelerated compute softmax on a slice of data
+    pub fn compute_simd(&self, data: &mut [f32]) {
+        if data.is_empty() {
+            return;
+        }
+
+        let max_val = data.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+        if max_val == f32::NEG_INFINITY {
+            return;
+        }
+
+        // Compute exp(x - max) and sum
+        let mut temp1 = vec![0.0f32; data.len()];
+        sub_scalar_simd(data, &mut temp1, max_val, self.simd_level);
+        let mut temp2 = vec![0.0f32; data.len()];
+        exp_simd(&temp1, &mut temp2, self.simd_level);
+        let exp_sum = horizontal_sum(&temp2, self.simd_level);
+
+        if exp_sum > 0.0 {
+            // Apply softmax: exp(x - max) / exp_sum
+            div_scalar_simd(&temp2, data, exp_sum, self.simd_level);
         }
     }
 }
@@ -189,6 +253,52 @@ mod tests {
         // Large values that would overflow without stabilization
         let mut data = vec![1000.0, 1001.0, 1002.0];
         Softmax::compute(&mut data);
+
+        let sum: f32 = data.iter().sum();
+        assert!((sum - 1.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn test_softmax_simd_compute() {
+        let level = detect_simd_level();
+        let op = Softmax::with_simd_level(SoftmaxAxis::Last, level);
+
+        let mut data = vec![1.0, 2.0, 3.0];
+        op.compute_simd(&mut data);
+
+        // Sum should be 1
+        let sum: f32 = data.iter().sum();
+        assert!((sum - 1.0).abs() < 0.0001);
+
+        // All values should be positive
+        assert!(data.iter().all(|&x| x > 0.0));
+
+        // Largest value should be the largest output
+        let max_output = data.iter().fold(0.0f32, |a, &b| a.max(b));
+        assert!((max_output - data[2]).abs() < 0.0001);
+    }
+
+    #[test]
+    fn test_softmax_simd_compute_sum_exp() {
+        use crate::platform::SimdLevel;
+
+        let op = Softmax::with_simd_level(SoftmaxAxis::Last, SimdLevel::None);
+        let data = vec![1.0, 2.0, 3.0];
+        let (max_val, exp_sum) = op.compute_sum_exp_simd(&data);
+
+        assert_eq!(max_val, 3.0);
+        // exp(1-3) + exp(2-3) + exp(3-3) = exp(-2) + exp(-1) + exp(0)
+        assert!((exp_sum - (std::f32::consts::E.powi(-2) + std::f32::consts::E.powi(-1) + 1.0)).abs() < 0.0001);
+    }
+
+    #[test]
+    fn test_softmax_simd_numerical_stability() {
+        let level = detect_simd_level();
+        let op = Softmax::with_simd_level(SoftmaxAxis::Last, level);
+
+        // Large values that would overflow without stabilization
+        let mut data = vec![1000.0, 1001.0, 1002.0];
+        op.compute_simd(&mut data);
 
         let sum: f32 = data.iter().sum();
         assert!((sum - 1.0).abs() < 0.0001);
