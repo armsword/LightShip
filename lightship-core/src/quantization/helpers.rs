@@ -1,0 +1,106 @@
+//! Quantization helper functions
+//!
+//! Provides utilities for quantizing and dequantizing tensors.
+
+use crate::common::DataType;
+use crate::ir::Tensor;
+
+use super::scheme::{QuantizationParameters, QuantizationScheme};
+
+/// Quantize a tensor according to the given scheme
+pub fn quantize_tensor(tensor: &Tensor, scheme: &QuantizationScheme) -> Tensor {
+    // For now, create a placeholder quantized tensor
+    // Real implementation would convert data types
+    let mut result = tensor.clone();
+    result
+}
+
+/// Dequantize a tensor according to the given scheme
+pub fn dequantize_tensor(tensor: &Tensor, scheme: &QuantizationScheme) -> Tensor {
+    // For now, create a placeholder dequantized tensor
+    // Real implementation would convert back to float
+    let mut result = tensor.clone();
+    result
+}
+
+/// Find optimal scale and zero-point for a tensor
+///
+/// Uses the Min-Max quantization method:
+/// - scale = (max - min) / (qmax - qmin)
+/// - zero_point = qmin - min / scale
+pub fn find_scale_zp(data: &[f32], dtype: DataType, is_symmetric: bool) -> QuantizationParameters {
+    if data.is_empty() {
+        return QuantizationParameters::default();
+    }
+
+    let min_val = data.iter().cloned().fold(f32::INFINITY, f32::min);
+    let max_val = data.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+
+    let (qmin, qmax) = match dtype {
+        DataType::QUInt8 => (0i32, 255i32),
+        DataType::QInt8 => (-128i32, 127i32),
+        DataType::QInt32 => (i32::MIN, i32::MAX),
+        _ => (0i32, 255i32),
+    };
+
+    if is_symmetric {
+        // Symmetric: zero_point = 0
+        let abs_max = max_val.abs().max(min_val.abs());
+        let scale = if abs_max > 0.0 {
+            abs_max / (qmax as f32)
+        } else {
+            1.0
+        };
+        QuantizationParameters::new_per_tensor(scale, 0, 8)
+    } else {
+        // Asymmetric
+        let scale = if max_val > min_val {
+            (max_val - min_val) / ((qmax - qmin) as f32)
+        } else {
+            1.0
+        };
+        let zero_point = qmin as f32 - min_val / scale;
+        let zero_point_i32 = zero_point.round() as i32;
+        QuantizationParameters::new_per_tensor(scale, zero_point_i32, 8)
+    }
+}
+
+/// Quantize a single value
+pub fn quantize_value(value: f32, scale: f32, zero_point: i32, dtype: DataType) -> i32 {
+    let qmin = match dtype {
+        DataType::QUInt8 => 0i32,
+        DataType::QInt8 => -128i32,
+        DataType::QInt32 => i32::MIN,
+        _ => 0i32,
+    };
+    let qmax = match dtype {
+        DataType::QUInt8 => 255i32,
+        DataType::QInt8 => 127i32,
+        DataType::QInt32 => i32::MAX,
+        _ => 255i32,
+    };
+
+    let quantized = (value / scale).round() as i32 + zero_point as i32;
+    quantized.clamp(qmin, qmax)
+}
+
+/// Dequantize a single value
+pub fn dequantize_value(quantized: i32, scale: f32, zero_point: i32) -> f32 {
+    (quantized as f32 - zero_point as f32) * scale
+}
+
+/// Compute MSE between original and quantized-dequantized values
+pub fn compute_quantization_error(original: &[f32], reconstructed: &[f32]) -> f32 {
+    if original.len() != reconstructed.len() {
+        return f32::INFINITY;
+    }
+
+    let sum_sq_error: f32 = original
+        .iter()
+        .zip(reconstructed.iter())
+        .map(|(o, r)| (o - r).powi(2))
+        .sum();
+
+    let mse = sum_sq_error / original.len() as f32;
+    mse.sqrt()
+}

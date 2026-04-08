@@ -14,5 +14,6 @@ pub mod backend;
 pub mod model;
 pub mod memory;
 pub mod executor;
+pub mod quantization;
 
 pub use common::{error::LightShipError, types::*};
