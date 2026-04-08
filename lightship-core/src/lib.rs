@@ -17,5 +17,7 @@ pub mod executor;
 pub mod quantization;
 pub mod operator;
 pub mod runtime;
+pub mod platform;
+pub mod capi;
 
 pub use common::{error::LightShipError, types::*};
