@@ -232,6 +232,68 @@ let level = detect_simd_level();
 relu_simd(&input, &mut output, level);
 ```
 
+## Conv2d 算子优化
+
+LightShip 在 `operator/convolution.rs` 中实现了 Conv2d 卷积算子：
+
+### Im2col 变换
+
+Im2col (Image to Column) 将卷积操作转换为矩阵乘法：
+
+```
+输入特征图                    Im2col 展开
+┌─────────────┐              ┌────────────────────┐
+│ a b c d     │              │ b c d 0            │
+│ e f g h     │   Im2col     │ c d 0 0            │
+│ i j k l     │ ──────────▶  │ d 0 0 0            │
+│ m n o p     │              │ e f g h            │
+└─────────────┘              │ f g h 0            │
+                             │ ...                │
+                             └────────────────────┘
+```
+
+**优点**：
+- 将稀疏的卷积操作转换为密集的矩阵乘法
+- 可以利用优化的 BLAS (GEMM) 库
+
+### Conv2d 配置
+
+```rust
+pub struct Conv2dConfig {
+    pub out_channels: usize,
+    pub kernel_h: usize,
+    pub kernel_w: usize,
+    pub stride_h: usize,
+    pub stride_w: usize,
+    pub pad_h: usize,
+    pub pad_w: usize,
+    pub dilation_h: usize,
+    pub dilation_w: usize,
+    pub groups: usize,  // 分组卷积
+}
+```
+
+### 前向传播
+
+```rust
+let conv = Conv2d::new(config);
+let output = conv.forward(&input, &filter)?;
+```
+
+### 支持的特性
+
+- 标准卷积 (groups=1)
+- 分组卷积 (groups>1)
+- Stride 卷积
+- 空洞卷积 (Dilation)
+- Padding
+
+### 后续优化方向
+
+1. **集成 SIMD GEMM**: 使用 `gemm_simd` 替代标量实现
+2. **Winograd 算法**: 对于 3x3 卷积可减少乘法次数
+3. **Direct 卷积优化**: 对于小卷积核的直接实现
+
 ## 未来优化方向
 
 1. **运行时 JIT 编译**: 根据检测到的 CPU 特性动态生成最优代码
