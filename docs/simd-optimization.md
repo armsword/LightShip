@@ -179,6 +179,59 @@ let data = _mm_loadu_ps(ptr);  // unaligned
 let data = _mm_load_ps(aligned_ptr);  // 必须16字节对齐
 ```
 
+## 已实现的算子内核
+
+LightShip 在 `platform/simd.rs` 中实现了以下向量化算子：
+
+### 1. ReLU / ReLU6
+
+```rust
+pub fn relu_simd(input: &[f32], output: &mut [f32], level: SimdLevel)
+pub fn relu6_simd(input: &[f32], output: &mut [f32], level: SimdLevel)
+```
+
+**实现方式**：
+- AVX-512: `_mm512_max_ps` 一次处理 16 个浮点
+- AVX2: `_mm256_max_ps` 一次处理 8 个浮点
+- SSE: `_mm_max_ps` 一次处理 4 个浮点
+- NEON: `vmaxq_f32` 一次处理 4 个浮点
+
+### 2. Element-wise Add / Mul
+
+```rust
+pub fn add_simd(a: &[f32], b: &[f32], c: &mut [f32], level: SimdLevel)
+pub fn mul_simd(a: &[f32], b: &[f32], c: &mut [f32], level: SimdLevel)
+```
+
+### 3. GEMM 矩阵乘法
+
+```rust
+pub fn gemm_simd(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize, level: SimdLevel)
+```
+
+采用分块策略：
+- 按输出行/列分块
+- 每块内按 SIMD 向量宽度展开
+- 使用 FMA (Fused Multiply-Add) 指令减少乘加延迟
+
+### 4. Horizontal Sum
+
+```rust
+pub fn horizontal_sum(arr: &[f32], level: SimdLevel) -> f32
+```
+
+用于 Softmax、LayerNorm 等需要归约操作的算子。
+
+## 运行时调度
+
+```rust
+pub fn detect_simd_level() -> SimdLevel
+
+// 使用示例
+let level = detect_simd_level();
+relu_simd(&input, &mut output, level);
+```
+
 ## 未来优化方向
 
 1. **运行时 JIT 编译**: 根据检测到的 CPU 特性动态生成最优代码
