@@ -11,6 +11,7 @@ use crate::model::metadata::ModelMetadata;
 use crate::common::ModelFormat;
 use std::collections::HashMap;
 use std::fmt::Debug;
+use std::io::{Cursor, Read};
 use std::path::Path;
 use std::result::Result as StdResult;
 
@@ -83,22 +84,22 @@ mod operators {
 /// ONNX data type mapping
 fn from_onnx_dtype(dtype: i32) -> Option<DataType> {
     match dtype {
-        1 => Some(DataType::F32),      // float
-        2 => Some(DataType::F64),      // double
-        3 => Some(DataType::F16),      // float16
-        4 => None,                     // bfloat16 (not supported)
-        5 => Some(DataType::I8),       // int8
-        6 => Some(DataType::I16),      // int16
-        7 => Some(DataType::I32),      // int32
-        8 => Some(DataType::I64),      // int64
-        9 => Some(DataType::U8),       // uint8
-        10 => Some(DataType::U16),     // uint16
-        11 => Some(DataType::U32),     // uint32
-        12 => Some(DataType::U64),     // uint64
-        13 => Some(DataType::Bool),    // bool
-        14 => Some(DataType::QUInt8),  // quint8
-        15 => Some(DataType::QInt8),   // qint8
-        16 => Some(DataType::QInt32),  // qint32
+        1 => Some(DataType::F32),
+        2 => Some(DataType::F64),
+        3 => Some(DataType::F16),
+        4 => None,
+        5 => Some(DataType::I8),
+        6 => Some(DataType::I16),
+        7 => Some(DataType::I32),
+        8 => Some(DataType::I64),
+        9 => Some(DataType::U8),
+        10 => Some(DataType::U16),
+        11 => Some(DataType::U32),
+        12 => Some(DataType::U64),
+        13 => Some(DataType::Bool),
+        14 => Some(DataType::QUInt8),
+        15 => Some(DataType::QInt8),
+        16 => Some(DataType::QInt32),
         _ => None,
     }
 }
@@ -132,72 +133,6 @@ fn parse_shape_string(s: &str) -> Vec<Dimension> {
         .collect()
 }
 
-/// ZIP file entry
-#[derive(Debug)]
-struct ZipEntry {
-    name: String,
-    data: Vec<u8>,
-}
-
-/// Parse a ZIP file and extract entries
-fn parse_zip(data: &[u8]) -> Result<Vec<ZipEntry>, ModelLoaderError> {
-    if data.len() < 4 || data[0] != 0x50 || data[1] != 0x4B {
-        return Err(ModelLoaderError::InvalidFormat("Invalid ZIP file".into()));
-    }
-
-    let mut entries = Vec::new();
-    let mut offset = 0;
-
-    while offset + 30 <= data.len() {
-        // Read local file header
-        if data[offset] != 0x50 || data[offset + 1] != 0x4B {
-            break;
-        }
-
-        let compression = u16::from_le_bytes([data[offset + 8], data[offset + 9]]);
-        let compressed_size = u32::from_le_bytes([
-            data[offset + 18], data[offset + 19], data[offset + 20], data[offset + 21]
-        ]) as usize;
-        let uncompressed_size = u32::from_le_bytes([
-            data[offset + 22], data[offset + 23], data[offset + 24], data[offset + 25]
-        ]) as usize;
-        let name_len = u16::from_le_bytes([data[offset + 26], data[offset + 27]]) as usize;
-        let extra_len = u16::from_le_bytes([data[offset + 28], data[offset + 29]]) as usize;
-
-        if offset + 30 + name_len > data.len() {
-            break;
-        }
-
-        let name = String::from_utf8_lossy(&data[offset + 30..offset + 30 + name_len]).to_string();
-        let data_start = offset + 30 + name_len + extra_len;
-
-        // Only handle stored (no compression) or deflate
-        let entry_data = if compression == 0 {
-            // Stored - no compression
-            if data_start + compressed_size > data.len() {
-                break;
-            }
-            data[data_start..data_start + compressed_size].to_vec()
-        } else if compression == 8 {
-            // Deflate - for now, just skip
-            tracing::warn!("Deflate compression not fully supported, skipping entry: {}", name);
-            offset = data_start + compressed_size;
-            continue;
-        } else {
-            break;
-        };
-
-        entries.push(ZipEntry {
-            name,
-            data: entry_data,
-        });
-
-        offset = data_start + compressed_size;
-    }
-
-    Ok(entries)
-}
-
 /// ONNX model loader
 pub struct OnnxLoader {
     // Protobuf parsing structures are defined inline
@@ -211,15 +146,29 @@ impl OnnxLoader {
 
     /// Extract graph.pb from ONNX ZIP and parse it
     fn parse_onnx_zip(&self, data: &[u8]) -> StdResult<ModelFile, ModelLoaderError> {
-        let entries = parse_zip(data)?;
+        let cursor = Cursor::new(data);
+        let mut archive = zip::ZipArchive::new(cursor)
+            .map_err(|e| ModelLoaderError::InvalidFormat(format!("Invalid ZIP archive: {}", e)))?;
 
-        // Find graph.pb
-        let graph_pb = entries
-            .iter()
-            .find(|e| e.name == "graph.pb")
+        // Find and read graph.pb
+        let mut graph_pb = None;
+        for i in 0..archive.len() {
+            let file = archive.by_index(i)
+                .map_err(|e| ModelLoaderError::InvalidFormat(format!("Failed to read ZIP entry: {}", e)))?;
+            if file.name() == "graph.pb" {
+                let mut buf = Vec::new();
+                let mut reader = file;
+                reader.read_to_end(&mut buf)
+                    .map_err(|e| ModelLoaderError::IoError(format!("Failed to read graph.pb: {}", e)))?;
+                graph_pb = Some(buf);
+                break;
+            }
+        }
+
+        let graph_pb = graph_pb
             .ok_or_else(|| ModelLoaderError::InvalidFormat("No graph.pb found in ONNX file".into()))?;
 
-        self.parse_graph_protobuf(&graph_pb.data)
+        self.parse_graph_protobuf(&graph_pb)
     }
 
     /// Parse graph.pb protobuf
@@ -257,8 +206,7 @@ impl OnnxLoader {
                 }
                 4 => {
                     // model_version
-                    if let Ok((varint, new_offset)) = self.read_varint(data, offset) {
-                        tracing::debug!("Model version: {}", varint);
+                    if let Ok((_, new_offset)) = self.read_varint(data, offset) {
                         offset = new_offset;
                     }
                 }
@@ -435,7 +383,6 @@ impl OnnxLoader {
     #[allow(dead_code)]
     fn parse_value_info(&self, data: &[u8], offset: usize) -> StdResult<Option<GraphIO>, ModelLoaderError> {
         let mut name = String::new();
-        let mut shape = Vec::new();
         let mut dtype = DataType::F32;
         let mut current_offset = offset;
 
@@ -481,40 +428,6 @@ impl OnnxLoader {
                                     } else {
                                         current_offset = self.skip_field(data, t_new, t_wire)?;
                                     }
-                                } else if t_field == 2 {
-                                    // shape - repeated dimension
-                                    current_offset = t_new;
-                                    // Try to parse dimensions
-                                    while current_offset < data.len() {
-                                        let (d_field, d_wire, d_new) = match self.read_tag(data, current_offset) {
-                                            Some(v) => v,
-                                            None => break,
-                                        };
-                                        if d_field == 1 {
-                                            // dim_value
-                                            if let Ok((varint, read_offset)) = self.read_varint(data, d_new) {
-                                                shape.push(varint as usize);
-                                                current_offset = read_offset;
-                                            } else {
-                                                current_offset = self.skip_field(data, d_new, d_wire)?;
-                                            }
-                                        } else if d_field == 2 {
-                                            // dim_param
-                                            if let Ok((str_val, read_offset)) = self.read_string(data, d_new) {
-                                                tracing::debug!("Dynamic dimension: {}", str_val);
-                                                current_offset = read_offset;
-                                            } else {
-                                                current_offset = self.skip_field(data, d_new, d_wire)?;
-                                            }
-                                        } else {
-                                            current_offset = self.skip_field(data, d_new, d_wire)?;
-                                        }
-                                        if d_wire == 4 {
-                                            // End of group
-                                            break;
-                                        }
-                                    }
-                                    break;
                                 } else {
                                     current_offset = self.skip_field(data, t_new, t_wire)?;
                                 }
@@ -801,30 +714,5 @@ mod tests {
         let loader = OnnxLoader::new();
         assert_eq!(loader.supported_formats(), vec![ModelFormat::ONNX]);
         assert_eq!(loader.name(), "ONNX Loader");
-    }
-
-    #[test]
-    fn test_zip_parsing() {
-        // Create a minimal ZIP file with one entry
-        let data = vec![
-            0x50, 0x4B, 0x03, 0x04, // Local file header signature
-            0x14, 0x00, // version needed
-            0x00, 0x00, // general purpose bit flag
-            0x00, 0x00, // compression method (stored)
-            0x00, 0x00, // last mod time
-            0x00, 0x00, // last mod date
-            0x00, 0x00, 0x00, 0x00, // CRC-32
-            0x05, 0x00, 0x00, 0x00, // compressed size (5)
-            0x05, 0x00, 0x00, 0x00, // uncompressed size (5)
-            0x04, 0x00, // file name length (4)
-            0x00, 0x00, // extra field length (0)
-            b't', b'e', b's', b't', // file name "test"
-            b'h', b'e', b'l', b'l', b'o', // file data "hello"
-        ];
-
-        let entries = parse_zip(&data).unwrap();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].name, "test");
-        assert_eq!(entries[0].data, b"hello");
     }
 }
