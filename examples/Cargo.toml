@@ -1,0 +1,21 @@
+[package]
+name = "lightship-examples"
+version = "0.1.0"
+edition = "2021"
+description = "LightShip example applications"
+publish = false
+
+[dependencies]
+lightship-core = { path = "../lightship-core" }
+tokio = { version = "1.0", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+anyhow = "1.0"
+
+[[example]]
+name = "basic_inference"
+path = "basic_inference.rs"
+
+[[example]]
+name = "async_inference"
+path = "async_inference.rs"

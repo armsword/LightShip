@@ -2,6 +2,8 @@
 resolver = "2"
 members = [
     "lightship-core",
+    "lightship-tools",
+    "examples",
 ]
 
 exclude = [
