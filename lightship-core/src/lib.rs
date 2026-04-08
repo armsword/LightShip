@@ -11,5 +11,6 @@ pub mod common;
 pub mod ir;
 pub mod api;
 pub mod backend;
+pub mod model;
 
 pub use common::{error::LightShipError, types::*};
