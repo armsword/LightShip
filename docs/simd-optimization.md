@@ -290,9 +290,9 @@ let output = conv.forward(&input, &filter)?;
 
 ### 后续优化方向
 
-1. **集成 SIMD GEMM**: 使用 `gemm_simd` 替代标量实现
-2. **Winograd 算法**: 对于 3x3 卷积可减少乘法次数
-3. **Direct 卷积优化**: 对于小卷积核的直接实现
+1. **Winograd 算法**: 对于 3x3 卷积可减少乘法次数
+2. **Direct 卷积优化**: 对于小卷积核的直接实现
+3. **内存布局优化**: NHWC 格式替代 NCHW
 
 ## 未来优化方向
 
