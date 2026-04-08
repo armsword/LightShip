@@ -8,6 +8,7 @@ mod softmax;
 mod layernorm;
 mod gelu;
 mod sigmoid;
+mod pooling;
 mod attention;
 mod convolution;
 
@@ -16,5 +17,6 @@ pub use softmax::Softmax;
 pub use layernorm::LayerNorm;
 pub use gelu::Gelu;
 pub use sigmoid::Sigmoid;
+pub use pooling::{Pool2d, Pool2dConfig, PoolType};
 pub use attention::{SelfAttention, MultiHeadAttention, SkipConnection};
 pub use convolution::{Conv2d, Conv2dConfig};
