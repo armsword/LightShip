@@ -10,7 +10,7 @@ use crate::backend::memory::StorageLocation;
 use crate::common::{BackendType, DataType, LightShipError, Result, StorageLayout};
 use crate::common::error::BackendError;
 use crate::ir::{OperatorDef, OperatorType, Tensor};
-use crate::platform::{detect_simd_level, relu_simd, relu6_simd, SimdLevel};
+use crate::platform::{add_simd, detect_simd_level, mul_simd, relu_simd, relu6_simd, SimdLevel};
 use std::alloc::{alloc, dealloc, Layout};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -280,17 +280,32 @@ impl CpuBackend {
             return Err(LightShipError::InvalidParam("Add inputs must have same size".into()));
         }
 
-        // Element-wise addition: a + b
+        let num_elements = input_bytes_a.len() / 4;
+
+        // Convert bytes to f32 slices
+        let a_f32: Vec<f32> = input_bytes_a
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let b_f32: Vec<f32> = input_bytes_b
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let mut c_f32 = vec![0.0f32; num_elements];
+
+        // Use SIMD acceleration
+        let simd_level = detect_simd_level();
+        add_simd(&a_f32, &b_f32, &mut c_f32, simd_level);
+
+        // Convert back to bytes
         let mut output_bytes = Vec::with_capacity(input_bytes_a.len());
-        for (chunk_a, chunk_b) in input_bytes_a.chunks_exact(4).zip(input_bytes_b.chunks_exact(4)) {
-            let a = f32::from_le_bytes([chunk_a[0], chunk_a[1], chunk_a[2], chunk_a[3]]);
-            let b = f32::from_le_bytes([chunk_b[0], chunk_b[1], chunk_b[2], chunk_b[3]]);
-            output_bytes.extend_from_slice(&(a + b).to_le_bytes());
+        for &val in &c_f32 {
+            output_bytes.extend_from_slice(&val.to_le_bytes());
         }
 
         output.data = crate::ir::TensorData::Owned(output_bytes);
 
-        tracing::debug!("CPU Add: executed {} elements", input_bytes_a.len() / 4);
+        tracing::debug!("CPU Add: executed {} elements, simd={:?}", num_elements, simd_level);
         Ok(())
     }
 
@@ -316,17 +331,32 @@ impl CpuBackend {
             return Err(LightShipError::InvalidParam("Mul inputs must have same size".into()));
         }
 
-        // Element-wise multiplication: a * b
+        let num_elements = input_bytes_a.len() / 4;
+
+        // Convert bytes to f32 slices
+        let a_f32: Vec<f32> = input_bytes_a
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let b_f32: Vec<f32> = input_bytes_b
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let mut c_f32 = vec![0.0f32; num_elements];
+
+        // Use SIMD acceleration
+        let simd_level = detect_simd_level();
+        mul_simd(&a_f32, &b_f32, &mut c_f32, simd_level);
+
+        // Convert back to bytes
         let mut output_bytes = Vec::with_capacity(input_bytes_a.len());
-        for (chunk_a, chunk_b) in input_bytes_a.chunks_exact(4).zip(input_bytes_b.chunks_exact(4)) {
-            let a = f32::from_le_bytes([chunk_a[0], chunk_a[1], chunk_a[2], chunk_a[3]]);
-            let b = f32::from_le_bytes([chunk_b[0], chunk_b[1], chunk_b[2], chunk_b[3]]);
-            output_bytes.extend_from_slice(&(a * b).to_le_bytes());
+        for &val in &c_f32 {
+            output_bytes.extend_from_slice(&val.to_le_bytes());
         }
 
         output.data = crate::ir::TensorData::Owned(output_bytes);
 
-        tracing::debug!("CPU Mul: executed {} elements", input_bytes_a.len() / 4);
+        tracing::debug!("CPU Mul: executed {} elements, simd={:?}", num_elements, simd_level);
         Ok(())
     }
 
