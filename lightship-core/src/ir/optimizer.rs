@@ -342,6 +342,7 @@ impl FusionPass {
                 FusionType::ConvReLU6,
                 FusionType::AddReLU,
                 FusionType::ConvBatchNorm,
+                FusionType::BatchNormReLU,
             ],
         }
     }
@@ -384,6 +385,16 @@ impl FusionPass {
                         if self.has_single_consumer(graph, &consumer) {
                             if self.fusion_types.contains(&FusionType::AddReLU) {
                                 candidates.push((node.id, consumer.id, FusionType::AddReLU));
+                            }
+                        }
+                    }
+                }
+                OperatorType::BatchNorm => {
+                    // Look for ReLU/ReLU6 consumers (BatchNorm + ReLU fusion)
+                    if let Some(consumer) = self.find_relu_consumer(graph, node) {
+                        if self.has_single_consumer(graph, &consumer) {
+                            if self.fusion_types.contains(&FusionType::BatchNormReLU) {
+                                candidates.push((node.id, consumer.id, FusionType::BatchNormReLU));
                             }
                         }
                     }
@@ -563,6 +574,52 @@ impl FusionPass {
         // Remove the BatchNorm node
         graph.retain_nodes(|n| n.id != bn_id);
     }
+
+    /// Fuse BatchNorm + ReLU into a single BatchNorm node with fusion info
+    ///
+    /// This performs a "lightweight" fusion where:
+    /// 1. The BatchNorm node is marked with FusionInfo indicating BN+ReLU fusion
+    /// 2. Consumers of ReLU are redirected to use BatchNorm's output
+    /// 3. The ReLU node is removed from the graph
+    fn fuse_batchnorm_relu(&self, graph: &mut Graph, bn_id: NodeId, relu_id: NodeId) {
+        // First, collect all the information we need
+        let (relu_output, bn_output) = {
+            let relu_out = graph.nodes.iter()
+                .find(|n| n.id == relu_id)
+                .and_then(|n| n.outputs.first())
+                .map(|o| o.tensor_name.clone());
+
+            let bn_out = graph.nodes.iter()
+                .find(|n| n.id == bn_id)
+                .and_then(|n| n.outputs.first())
+                .map(|o| o.tensor_name.clone());
+
+            (relu_out, bn_out)
+        };
+
+        // Update the BatchNorm node's fusion info
+        if let Some(bn_node) = graph.nodes.iter_mut().find(|n| n.id == bn_id) {
+            let fusion_info = FusionInfo::new(
+                FusionType::BatchNormReLU,
+                vec![OperatorType::BatchNorm, OperatorType::ReLU],
+            );
+            bn_node.fusion = Some(fusion_info);
+        }
+
+        // Update consumers of relu_output to use bn_output
+        if let (Some(relu_out), Some(bn_out)) = (relu_output, bn_output) {
+            for node in &mut graph.nodes {
+                for input in &mut node.inputs {
+                    if input.tensor_name == relu_out {
+                        input.tensor_name = bn_out.clone();
+                    }
+                }
+            }
+        }
+
+        // Remove the ReLU node
+        graph.retain_nodes(|n| n.id != relu_id);
+    }
 }
 
 impl GraphOptimizer for FusionPass {
@@ -581,6 +638,9 @@ impl GraphOptimizer for FusionPass {
                 }
                 FusionType::ConvBatchNorm => {
                     self.fuse_conv_batch_norm(graph, producer_id, consumer_id);
+                }
+                FusionType::BatchNormReLU => {
+                    self.fuse_batchnorm_relu(graph, producer_id, consumer_id);
                 }
                 _ => {}
             }
@@ -818,5 +878,68 @@ mod tests {
         assert!(output_node.is_some());
         let output = output_node.unwrap();
         assert_eq!(output.inputs[0].tensor_name, "conv_output");
+    }
+
+    #[test]
+    fn test_find_batchnorm_relu_fusion() {
+        let fusion = FusionPass::new();
+        let mut graph = create_test_graph();
+
+        // Create: BatchNorm -> ReLU
+        let bn_id = add_batchnorm_node(&mut graph, "bn", "input");
+        let _relu_id = add_relu_node(&mut graph, "relu", "bn_output");
+
+        // Add an output consumer
+        let _output_node = add_generic_node(&mut graph, "output", OperatorType::Reshape, vec!["relu_output"], vec!["final_output"]);
+
+        let candidates = fusion.find_fusion_candidates(&graph);
+        assert!(candidates.iter().any(|(_, _, ft)| *ft == FusionType::BatchNormReLU));
+    }
+
+    #[test]
+    fn test_batchnorm_relu_fusion() {
+        let fusion = FusionPass::new();
+        let mut graph = create_test_graph();
+
+        // Create: BatchNorm -> ReLU
+        let bn_id = add_batchnorm_node(&mut graph, "bn", "input");
+        let relu_id = add_relu_node(&mut graph, "relu", "bn_output");
+
+        // Add an output consumer
+        let _output_node = add_generic_node(&mut graph, "output", OperatorType::Reshape, vec!["relu_output"], vec!["final_output"]);
+
+        // Apply fusion
+        fusion.optimize(&mut graph);
+
+        // Check that ReLU is removed
+        let relu_exists = graph.nodes.iter().any(|n| n.id == relu_id);
+        assert!(!relu_exists, "ReLU node should be removed after fusion");
+
+        // Check that BatchNorm has fusion info
+        let bn_node = graph.nodes.iter().find(|n| n.id == bn_id);
+        assert!(bn_node.is_some());
+        let bn = bn_node.unwrap();
+        assert!(bn.fusion.is_some());
+        assert_eq!(bn.fusion.as_ref().unwrap().fusion_type, FusionType::BatchNormReLU);
+    }
+
+    #[test]
+    fn test_batchnorm_relu_fusion_eliminates_relu() {
+        let fusion = FusionPass::new();
+        let mut graph = create_test_graph();
+
+        // Create: BatchNorm -> ReLU -> Output
+        let _bn_id = add_batchnorm_node(&mut graph, "bn", "input");
+        let _relu_id = add_relu_node(&mut graph, "relu", "bn_output");
+        let output_id = add_generic_node(&mut graph, "output", OperatorType::Reshape, vec!["relu_output"], vec!["final_output"]);
+
+        // Apply fusion
+        fusion.optimize(&mut graph);
+
+        // The output node's input should now be bn_output instead of relu_output
+        let output_node = graph.nodes.iter().find(|n| n.id == output_id);
+        assert!(output_node.is_some());
+        let output = output_node.unwrap();
+        assert_eq!(output.inputs[0].tensor_name, "bn_output");
     }
 }
