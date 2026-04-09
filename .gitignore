@@ -1,0 +1,19 @@
+spec.md
+plan.md
+tasks.md
+CLAUDE.md
+
+# Build outputs
+/target/
+target/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db

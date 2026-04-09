@@ -11,6 +11,7 @@ mod sigmoid;
 mod silu;
 mod tanh;
 mod pooling;
+mod batchnorm;
 mod attention;
 mod convolution;
 
@@ -22,5 +23,6 @@ pub use sigmoid::Sigmoid;
 pub use silu::{SiLU, Swish};
 pub use tanh::Tanh;
 pub use pooling::{Pool2d, Pool2dConfig, PoolType};
+pub use batchnorm::BatchNorm;
 pub use attention::{SelfAttention, MultiHeadAttention, SkipConnection};
 pub use convolution::{Conv2d, Conv2dConfig};
