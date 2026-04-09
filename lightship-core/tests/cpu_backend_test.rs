@@ -437,3 +437,55 @@ fn test_cpu_backend_execute_avgpool2d() {
     let tolerance = 0.001;
     assert!((output_data[0] - 2.5).abs() < tolerance);
 }
+
+#[test]
+fn test_cpu_backend_execute_softmax() {
+    let backend = CpuBackend::new();
+
+    let mut op_def = OperatorDef::new("softmax".into(), OperatorType::Softmax);
+    op_def.inputs.push(NodeIO {
+        tensor_name: "input".into(),
+        data_type: DataType::F32,
+    });
+    op_def.outputs.push(NodeIO {
+        tensor_name: "output".into(),
+        data_type: DataType::F32,
+    });
+
+    // Softmax: exp(x_i) / sum(exp(x_j))
+    // Input: [1.0, 2.0, 3.0]
+    // exp([1,2,3]) = [e, e^2, e^3] ≈ [2.718, 7.389, 20.086]
+    // sum ≈ 30.193
+    // output ≈ [0.090, 0.245, 0.665]
+    let input = Tensor::from_data(
+        "input".into(),
+        vec![3],
+        DataType::F32,
+        vec![1.0f32, 2.0, 3.0],
+    );
+    let mut output = Tensor::new("output".into(), vec![3], DataType::F32);
+
+    let compiled = backend
+        .compile_operator(&op_def, &[&input], &[&output])
+        .unwrap();
+
+    let result = backend.execute(&compiled, &[&input], &mut [&mut output]);
+    assert!(result.is_ok());
+
+    // Verify Softmax output
+    let bytes = output.data_as_bytes();
+    let output_data: Vec<f32> = bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+
+    // Check sum = 1.0
+    let sum: f32 = output_data.iter().sum();
+    assert!((sum - 1.0).abs() < 0.001);
+
+    // Check individual values
+    let tolerance = 0.01;
+    assert!((output_data[0] - 0.090).abs() < tolerance);
+    assert!((output_data[1] - 0.245).abs() < tolerance);
+    assert!((output_data[2] - 0.665).abs() < tolerance);
+}

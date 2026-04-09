@@ -154,6 +154,7 @@ impl Backend for CpuBackend {
             OperatorType::Tanh => self.execute_tanh(inputs, outputs),
             OperatorType::MaxPool2d => self.execute_maxpool2d(inputs, outputs),
             OperatorType::AvgPool2d => self.execute_avgpool2d(inputs, outputs),
+            OperatorType::Softmax => self.execute_softmax(inputs, outputs),
             _ => {
                 tracing::debug!(
                     "CPU backend: operator {:?} execution not yet implemented",
@@ -543,6 +544,53 @@ impl CpuBackend {
         output.data = crate::ir::TensorData::Owned(output_bytes);
 
         tracing::debug!("CPU AvgPool2d: output shape=[{}, {}, {}, {}]", batch, channels, out_h, out_w);
+        Ok(())
+    }
+
+    fn execute_softmax(&self, inputs: &[&Tensor], outputs: &mut [&mut Tensor]) -> Result<()> {
+        if inputs.is_empty() || outputs.is_empty() {
+            return Err(LightShipError::InvalidParam("Missing input or output".into()));
+        }
+
+        let input = inputs[0];
+        let output = &mut outputs[0];
+
+        if input.data_type != DataType::F32 {
+            return Err(LightShipError::Backend(
+                BackendError::UnsupportedDataType(format!("{:?}", input.data_type)),
+            ));
+        }
+
+        let input_bytes = input.data_as_bytes();
+        let num_elements = input_bytes.len() / 4;
+
+        // Read input values
+        let values: Vec<f32> = input_bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+
+        // Compute softmax: exp(x_i) / sum(exp(x_j))
+        // Subtract max for numerical stability: softmax(x) = exp(x - max) / sum(exp(x - max))
+        let max_val = values.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+
+        let exp_values: Vec<f32> = values
+            .iter()
+            .map(|&v| (v - max_val).exp())
+            .collect();
+
+        let sum_exp: f32 = exp_values.iter().sum();
+
+        // Compute output
+        let mut output_bytes = Vec::with_capacity(input_bytes.len());
+        for exp_v in exp_values {
+            let softmax = exp_v / sum_exp;
+            output_bytes.extend_from_slice(&softmax.to_le_bytes());
+        }
+
+        output.data = crate::ir::TensorData::Owned(output_bytes);
+
+        tracing::debug!("CPU Softmax: {} elements, sum_exp={}", num_elements, sum_exp);
         Ok(())
     }
 }
