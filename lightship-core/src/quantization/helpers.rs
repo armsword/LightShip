@@ -3,23 +3,93 @@
 //! Provides utilities for quantizing and dequantizing tensors.
 
 use crate::common::DataType;
-use crate::ir::Tensor;
+use crate::ir::{Tensor, TensorData};
 
 use super::scheme::{QuantizationParameters, QuantizationScheme};
 
 /// Quantize a tensor according to the given scheme
 pub fn quantize_tensor(tensor: &Tensor, scheme: &QuantizationScheme) -> Tensor {
-    // For now, create a placeholder quantized tensor
-    // Real implementation would convert data types
-    let mut result = tensor.clone();
+    let params = &scheme.parameters;
+    let scale = params.scales.first().copied().unwrap_or(1.0);
+    let zero_point = params.zero_points.first().copied().unwrap_or(0);
+    let dtype = scheme.target_dtype;
+
+    // Get F32 data from tensor
+    let bytes = tensor.data_as_bytes();
+    let f32_data: Vec<f32> = bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+
+    let quantized: Vec<i32> = f32_data
+        .iter()
+        .map(|&v| quantize_value(v, scale, zero_point, dtype))
+        .collect();
+
+    // Convert to bytes based on target type
+    let bytes: Vec<u8> = match dtype {
+        DataType::QUInt8 => quantized.iter().map(|&v| v as u8).collect(),
+        DataType::QInt8 => quantized.iter().map(|&v| v as i8 as u8).collect(),
+        DataType::QInt32 => {
+            let mut b = Vec::with_capacity(quantized.len() * 4);
+            for &v in &quantized {
+                b.extend_from_slice(&v.to_le_bytes());
+            }
+            b
+        }
+        _ => return tensor.clone(),
+    };
+
+    let mut result = Tensor::new(
+        format!("{}_quantized", tensor.name),
+        tensor.shape.clone(),
+        dtype,
+    );
+    result.data = TensorData::Owned(bytes);
     result
 }
 
 /// Dequantize a tensor according to the given scheme
 pub fn dequantize_tensor(tensor: &Tensor, scheme: &QuantizationScheme) -> Tensor {
-    // For now, create a placeholder dequantized tensor
-    // Real implementation would convert back to float
-    let mut result = tensor.clone();
+    let params = &scheme.parameters;
+    let scale = params.scales.first().copied().unwrap_or(1.0);
+    let zero_point = params.zero_points.first().copied().unwrap_or(0);
+
+    let dtype = tensor.data_type;
+
+    // Get quantized bytes
+    let bytes = tensor.data_as_bytes();
+
+    // Dequantize based on type
+    let float_values: Vec<f32> = match dtype {
+        DataType::QUInt8 => bytes.iter().map(|&v| dequantize_value(v as i32, scale, zero_point)).collect(),
+        DataType::QInt8 => bytes.iter().map(|&v| dequantize_value(v as i8 as i32, scale, zero_point)).collect(),
+        DataType::QInt32 => {
+            let mut values = Vec::with_capacity(bytes.len() / 4);
+            for chunk in bytes.chunks(4) {
+                if chunk.len() == 4 {
+                    let v = i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                    values.push(dequantize_value(v, scale, zero_point));
+                }
+            }
+            values
+        }
+        _ => return tensor.clone(),
+    };
+
+    // Convert f32 values to bytes
+    let mut result_bytes = Vec::with_capacity(float_values.len() * 4);
+    for &v in &float_values {
+        result_bytes.extend_from_slice(&v.to_le_bytes());
+    }
+
+    let mut result = Tensor::new(
+        format!("{}_dequantized", tensor.name),
+        tensor.shape.clone(),
+        DataType::F32,
+    );
+    result.data = TensorData::Owned(result_bytes);
+
     result
 }
 
