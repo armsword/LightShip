@@ -158,6 +158,8 @@ impl Backend for CpuBackend {
             OperatorType::Div => self.execute_div(inputs, outputs),
             OperatorType::Sub => self.execute_sub(inputs, outputs),
             OperatorType::MatMul => self.execute_matmul(inputs, outputs),
+            OperatorType::Reshape => self.execute_reshape(inputs, outputs),
+            OperatorType::Transpose => self.execute_transpose(inputs, outputs),
             _ => {
                 tracing::debug!(
                     "CPU backend: operator {:?} execution not yet implemented",
@@ -745,6 +747,78 @@ impl CpuBackend {
         output.data = crate::ir::TensorData::Owned(output_bytes);
 
         tracing::debug!("CPU MatMul: {}x{} @ {}x{} -> {}x{}", m, k, k, n, m, n);
+        Ok(())
+    }
+
+    fn execute_reshape(&self, inputs: &[&Tensor], outputs: &mut [&mut Tensor]) -> Result<()> {
+        if inputs.is_empty() || outputs.is_empty() {
+            return Err(LightShipError::InvalidParam("Missing input or output".into()));
+        }
+
+        let input = inputs[0];
+        let output = &mut outputs[0];
+
+        // Reshape just copies the data, shape is already set in output tensor
+        let input_bytes = input.data_as_bytes();
+        output.data = crate::ir::TensorData::Owned(input_bytes.to_vec());
+
+        tracing::debug!("CPU Reshape: {:?} -> {:?}", input.shape, output.shape);
+        Ok(())
+    }
+
+    fn execute_transpose(&self, inputs: &[&Tensor], outputs: &mut [&mut Tensor]) -> Result<()> {
+        if inputs.is_empty() || outputs.is_empty() {
+            return Err(LightShipError::InvalidParam("Missing input or output".into()));
+        }
+
+        let input = inputs[0];
+        let output = &mut outputs[0];
+
+        if input.data_type != DataType::F32 {
+            return Err(LightShipError::Backend(
+                BackendError::UnsupportedDataType(format!("{:?}", input.data_type)),
+            ));
+        }
+
+        // Assume 2D matrix transpose
+        if input.shape.len() != 2 || output.shape.len() != 2 {
+            return Err(LightShipError::InvalidParam("Transpose requires 2D input/output".into()));
+        }
+
+        let [rows, cols] = &input.shape[..2] else {
+            return Err(LightShipError::InvalidParam("Invalid input shape".into()));
+        };
+
+        let [out_rows, out_cols] = &output.shape[..2] else {
+            return Err(LightShipError::InvalidParam("Invalid output shape".into()));
+        };
+
+        if *out_rows != *cols || *out_cols != *rows {
+            return Err(LightShipError::InvalidParam(
+                format!("Transpose shape mismatch: input {}x{} -> output {}x{}", rows, cols, out_rows, out_cols)
+            ));
+        }
+
+        let input_bytes = input.data_as_bytes();
+
+        // Transpose: output[j,i] = input[i,j]
+        let mut output_bytes = Vec::with_capacity(input_bytes.len());
+
+        for j in 0..*cols {
+            for i in 0..*rows {
+                let idx = (i * cols + j) * 4;
+                output_bytes.extend_from_slice(&[
+                    input_bytes[idx],
+                    input_bytes[idx + 1],
+                    input_bytes[idx + 2],
+                    input_bytes[idx + 3],
+                ]);
+            }
+        }
+
+        output.data = crate::ir::TensorData::Owned(output_bytes);
+
+        tracing::debug!("CPU Transpose: {:?} -> {:?}", input.shape, output.shape);
         Ok(())
     }
 }

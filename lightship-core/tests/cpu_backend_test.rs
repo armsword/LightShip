@@ -659,3 +659,92 @@ fn test_cpu_backend_execute_matmul() {
     assert!((output_data[2] - 139.0).abs() < tolerance); // Row 1, Col 0
     assert!((output_data[3] - 154.0).abs() < tolerance); // Row 1, Col 1
 }
+
+#[test]
+fn test_cpu_backend_execute_reshape() {
+    let backend = CpuBackend::new();
+
+    let mut op_def = OperatorDef::new("reshape".into(), OperatorType::Reshape);
+    op_def.inputs.push(NodeIO {
+        tensor_name: "input".into(),
+        data_type: DataType::F32,
+    });
+    op_def.outputs.push(NodeIO {
+        tensor_name: "output".into(),
+        data_type: DataType::F32,
+    });
+
+    // Input: [1, 2, 3, 4] with shape [4]
+    // Reshape to [2, 2]
+    let input = Tensor::from_data(
+        "input".into(),
+        vec![4],
+        DataType::F32,
+        vec![1.0f32, 2.0, 3.0, 4.0],
+    );
+    let mut output = Tensor::new("output".into(), vec![2, 2], DataType::F32);
+
+    let compiled = backend
+        .compile_operator(&op_def, &[&input], &[&output])
+        .unwrap();
+
+    let result = backend.execute(&compiled, &[&input], &mut [&mut output]);
+    assert!(result.is_ok());
+
+    // Reshape should preserve data, just change shape
+    let bytes = output.data_as_bytes();
+    let output_data: Vec<f32> = bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+
+    assert_eq!(output_data, &[1.0, 2.0, 3.0, 4.0]);
+    assert_eq!(output.shape, vec![2, 2]);
+}
+
+#[test]
+fn test_cpu_backend_execute_transpose() {
+    let backend = CpuBackend::new();
+
+    let mut op_def = OperatorDef::new("transpose".into(), OperatorType::Transpose);
+    op_def.inputs.push(NodeIO {
+        tensor_name: "input".into(),
+        data_type: DataType::F32,
+    });
+    op_def.outputs.push(NodeIO {
+        tensor_name: "output".into(),
+        data_type: DataType::F32,
+    });
+
+    // Input 2x3 matrix:
+    // [1, 2, 3]
+    // [4, 5, 6]
+    // Transpose -> 3x2 matrix:
+    // [1, 4]
+    // [2, 5]
+    // [3, 6]
+    let input = Tensor::from_data(
+        "input".into(),
+        vec![2, 3],
+        DataType::F32,
+        vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0],
+    );
+    let mut output = Tensor::new("output".into(), vec![3, 2], DataType::F32);
+
+    let compiled = backend
+        .compile_operator(&op_def, &[&input], &[&output])
+        .unwrap();
+
+    let result = backend.execute(&compiled, &[&input], &mut [&mut output]);
+    assert!(result.is_ok());
+
+    // Verify transpose
+    let bytes = output.data_as_bytes();
+    let output_data: Vec<f32> = bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+
+    // Row 0: [1, 4], Row 1: [2, 5], Row 2: [3, 6]
+    assert_eq!(output_data, &[1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
+}
