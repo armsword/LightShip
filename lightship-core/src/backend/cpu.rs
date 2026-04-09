@@ -163,6 +163,7 @@ impl Backend for CpuBackend {
             OperatorType::Transpose => self.execute_transpose(inputs, outputs),
             OperatorType::Conv2d => self.execute_conv2d(inputs, outputs),
             OperatorType::BatchNorm => self.execute_batchnorm(inputs, outputs),
+            OperatorType::FullyConnected => self.execute_fullyconnected(inputs, outputs),
             _ => {
                 tracing::debug!(
                     "CPU backend: operator {:?} execution not yet implemented",
@@ -894,6 +895,89 @@ impl CpuBackend {
         output.data = result.data;
 
         tracing::debug!("CPU BatchNorm: input shape={:?}, channels={}", input.shape, num_features);
+        Ok(())
+    }
+
+    fn execute_fullyconnected(&self, inputs: &[&Tensor], outputs: &mut [&mut Tensor]) -> Result<()> {
+        if inputs.len() < 2 || outputs.is_empty() {
+            return Err(LightShipError::InvalidParam("FullyConnected requires 2 inputs (input, weight) and 1 output".into()));
+        }
+
+        let input = inputs[0];
+        let weight = inputs[1];
+        let output = &mut outputs[0];
+
+        if input.data_type != DataType::F32 || weight.data_type != DataType::F32 {
+            return Err(LightShipError::Backend(
+                BackendError::UnsupportedDataType("FullyConnected requires F32 inputs".into()),
+            ));
+        }
+
+        // Input: [batch, in_features]
+        // Weight: [out_features, in_features]
+        // Output: [batch, out_features]
+        //
+        // FC: output = input @ weight.T
+        // where weight.T has shape [in_features, out_features]
+
+        if input.shape.len() != 2 || weight.shape.len() != 2 {
+            return Err(LightShipError::InvalidParam("FullyConnected requires 2D input and weight".into()));
+        }
+
+        let [batch, in_features] = &input.shape[..2] else {
+            return Err(LightShipError::InvalidParam("Invalid input shape".into()));
+        };
+
+        let [out_features, weight_in_features] = &weight.shape[..2] else {
+            return Err(LightShipError::InvalidParam("Invalid weight shape".into()));
+        };
+
+        if *weight_in_features != *in_features {
+            return Err(LightShipError::InvalidParam(
+                format!("Weight in_features {} != input in_features {}", weight_in_features, in_features)
+            ));
+        }
+
+        let input_bytes = input.data_as_bytes();
+        let weight_bytes = weight.data_as_bytes();
+
+        // FC: output[b, out_f] = sum_j (input[b, j] * weight[out_f, j])
+        // Note: weight is stored as [out_features, in_features]
+        let mut output_bytes = Vec::with_capacity(batch * out_features * 4);
+
+        for b in 0..*batch {
+            for out_f in 0..*out_features {
+                let mut sum = 0.0f32;
+
+                for in_f in 0..*in_features {
+                    // input[b, in_f]
+                    let input_idx = (b * in_features + in_f) * 4;
+                    let input_val = f32::from_le_bytes([
+                        input_bytes[input_idx],
+                        input_bytes[input_idx + 1],
+                        input_bytes[input_idx + 2],
+                        input_bytes[input_idx + 3],
+                    ]);
+
+                    // weight[out_f, in_f]
+                    let weight_idx = (out_f * in_features + in_f) * 4;
+                    let weight_val = f32::from_le_bytes([
+                        weight_bytes[weight_idx],
+                        weight_bytes[weight_idx + 1],
+                        weight_bytes[weight_idx + 2],
+                        weight_bytes[weight_idx + 3],
+                    ]);
+
+                    sum += input_val * weight_val;
+                }
+
+                output_bytes.extend_from_slice(&sum.to_le_bytes());
+            }
+        }
+
+        output.data = crate::ir::TensorData::Owned(output_bytes);
+
+        tracing::debug!("CPU FullyConnected: {}x{} @ {}x{} -> {}x{}", batch, in_features, out_features, in_features, batch, out_features);
         Ok(())
     }
 }

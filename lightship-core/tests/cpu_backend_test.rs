@@ -857,3 +857,68 @@ fn test_cpu_backend_execute_batchnorm() {
         assert!((*val - 4.0).abs() < tolerance, "Expected 4.0, got {}", val);
     }
 }
+
+#[test]
+fn test_cpu_backend_execute_fullyconnected() {
+    let backend = CpuBackend::new();
+
+    let mut op_def = OperatorDef::new("fc".into(), OperatorType::FullyConnected);
+    op_def.inputs.push(NodeIO {
+        tensor_name: "input".into(),
+        data_type: DataType::F32,
+    });
+    op_def.inputs.push(NodeIO {
+        tensor_name: "weight".into(),
+        data_type: DataType::F32,
+    });
+    op_def.outputs.push(NodeIO {
+        tensor_name: "output".into(),
+        data_type: DataType::F32,
+    });
+
+    // Input: [1, 4] (batch=1, features=4)
+    // Weight: [3, 4] (out_features=3, in_features=4)
+    // Output: [1, 3] (batch=1, out_features=3)
+    //
+    // input = [1, 2, 3, 4]
+    // weight = [[1, 1, 1, 1], [2, 2, 2, 2], [3, 3, 3, 3]]
+    // output[0] = 1*1 + 2*1 + 3*1 + 4*1 = 10
+    // output[1] = 1*2 + 2*2 + 3*2 + 4*2 = 20
+    // output[2] = 1*3 + 2*3 + 3*3 + 4*3 = 30
+    let input = Tensor::from_data(
+        "input".into(),
+        vec![1, 4],
+        DataType::F32,
+        vec![1.0f32, 2.0, 3.0, 4.0],
+    );
+    let weight = Tensor::from_data(
+        "weight".into(),
+        vec![3, 4],
+        DataType::F32,
+        vec![1.0f32, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 2.0, 3.0, 3.0, 3.0, 3.0],
+    );
+    let mut output = Tensor::new("output".into(), vec![1, 3], DataType::F32);
+
+    let compiled = backend
+        .compile_operator(&op_def, &[&input, &weight], &[&output])
+        .unwrap();
+
+    let result = backend.execute(&compiled, &[&input, &weight], &mut [&mut output]);
+    assert!(result.is_ok());
+
+    // Verify output
+    let bytes = output.data_as_bytes();
+    let output_data: Vec<f32> = bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+
+    // FC: output = input @ weight.T
+    // [1,3] = [1,4] @ [4,3]
+    // Row 0: [1*1+2*1+3*1+4*1, 1*2+2*2+3*2+4*2, 1*3+2*3+3*3+4*3]
+    //       = [10, 20, 30]
+    let tolerance = 0.001;
+    assert!((output_data[0] - 10.0).abs() < tolerance);
+    assert!((output_data[1] - 20.0).abs() < tolerance);
+    assert!((output_data[2] - 30.0).abs() < tolerance);
+}
