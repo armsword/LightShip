@@ -594,3 +594,68 @@ fn test_cpu_backend_execute_sub() {
 
     assert_eq!(output_data, &[3.0, 7.0, 11.0]);
 }
+
+#[test]
+fn test_cpu_backend_execute_matmul() {
+    let backend = CpuBackend::new();
+
+    let mut op_def = OperatorDef::new("matmul".into(), OperatorType::MatMul);
+    op_def.inputs.push(NodeIO {
+        tensor_name: "a".into(),
+        data_type: DataType::F32,
+    });
+    op_def.inputs.push(NodeIO {
+        tensor_name: "b".into(),
+        data_type: DataType::F32,
+    });
+    op_def.outputs.push(NodeIO {
+        tensor_name: "c".into(),
+        data_type: DataType::F32,
+    });
+
+    // 2x3 matrix A:
+    // [1, 2, 3]
+    // [4, 5, 6]
+    //
+    // 3x2 matrix B:
+    // [7, 8]
+    // [9, 10]
+    // [11, 12]
+    //
+    // Result 2x2 matrix C:
+    // [1*7+2*9+3*11, 1*8+2*10+3*12] = [58, 64]
+    // [4*7+5*9+6*11, 4*8+5*10+6*12] = [139, 154]
+    let input_a = Tensor::from_data(
+        "a".into(),
+        vec![2, 3],  // 2 rows, 3 cols
+        DataType::F32,
+        vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0],
+    );
+    let input_b = Tensor::from_data(
+        "b".into(),
+        vec![3, 2],  // 3 rows, 2 cols
+        DataType::F32,
+        vec![7.0f32, 8.0, 9.0, 10.0, 11.0, 12.0],
+    );
+    let mut output = Tensor::new("c".into(), vec![2, 2], DataType::F32);
+
+    let compiled = backend
+        .compile_operator(&op_def, &[&input_a], &[&output])
+        .unwrap();
+
+    let result = backend.execute(&compiled, &[&input_a, &input_b], &mut [&mut output]);
+    assert!(result.is_ok());
+
+    let bytes = output.data_as_bytes();
+    let output_data: Vec<f32> = bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+
+    // C[0,0]=58, C[0,1]=64, C[1,0]=139, C[1,1]=154
+    let tolerance = 0.001;
+    assert!((output_data[0] - 58.0).abs() < tolerance);  // Row 0, Col 0
+    assert!((output_data[1] - 64.0).abs() < tolerance);  // Row 0, Col 1
+    assert!((output_data[2] - 139.0).abs() < tolerance); // Row 1, Col 0
+    assert!((output_data[3] - 154.0).abs() < tolerance); // Row 1, Col 1
+}

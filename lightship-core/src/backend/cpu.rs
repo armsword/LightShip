@@ -157,6 +157,7 @@ impl Backend for CpuBackend {
             OperatorType::Softmax => self.execute_softmax(inputs, outputs),
             OperatorType::Div => self.execute_div(inputs, outputs),
             OperatorType::Sub => self.execute_sub(inputs, outputs),
+            OperatorType::MatMul => self.execute_matmul(inputs, outputs),
             _ => {
                 tracing::debug!(
                     "CPU backend: operator {:?} execution not yet implemented",
@@ -665,6 +666,85 @@ impl CpuBackend {
         output.data = crate::ir::TensorData::Owned(output_bytes);
 
         tracing::debug!("CPU Sub: executed {} elements", input_bytes_a.len() / 4);
+        Ok(())
+    }
+
+    fn execute_matmul(&self, inputs: &[&Tensor], outputs: &mut [&mut Tensor]) -> Result<()> {
+        if inputs.len() < 2 || outputs.is_empty() {
+            return Err(LightShipError::InvalidParam("MatMul requires 2 inputs and 1 output".into()));
+        }
+
+        let input_a = inputs[0];
+        let input_b = inputs[1];
+        let output = &mut outputs[0];
+
+        if input_a.data_type != DataType::F32 || input_b.data_type != DataType::F32 {
+            return Err(LightShipError::Backend(
+                BackendError::UnsupportedDataType("MatMul requires F32 inputs".into()),
+            ));
+        }
+
+        // Assume 2D matrices: [M, K] and [K, N] -> [M, N]
+        if input_a.shape.len() != 2 || input_b.shape.len() != 2 {
+            return Err(LightShipError::InvalidParam("MatMul requires 2D matrices".into()));
+        }
+
+        let [m, k_a] = &input_a.shape[..2] else {
+            return Err(LightShipError::InvalidParam("Invalid matrix A shape".into()));
+        };
+
+        let [k_b, n] = &input_b.shape[..2] else {
+            return Err(LightShipError::InvalidParam("Invalid matrix B shape".into()));
+        };
+
+        if k_a != k_b {
+            return Err(LightShipError::InvalidParam(
+                format!("Matrix dimension mismatch: A_cols={} != B_rows={}", k_a, k_b)
+            ));
+        }
+
+        let k = *k_a;
+
+        let input_bytes_a = input_a.data_as_bytes();
+        let input_bytes_b = input_b.data_as_bytes();
+
+        // Compute C = A * B
+        // C[i,j] = sum_k A[i,k] * B[k,j]
+        let mut output_bytes = Vec::with_capacity(m * n * 4);
+
+        for i in 0..*m {
+            for j in 0..*n {
+                let mut sum = 0.0f32;
+
+                for k_idx in 0..k {
+                    // A[i,k_idx] at index i * k + k_idx
+                    let a_idx = (i * k + k_idx) * 4;
+                    let a_val = f32::from_le_bytes([
+                        input_bytes_a[a_idx],
+                        input_bytes_a[a_idx + 1],
+                        input_bytes_a[a_idx + 2],
+                        input_bytes_a[a_idx + 3],
+                    ]);
+
+                    // B[k_idx,j] at index k_idx * n + j
+                    let b_idx = (k_idx * n + j) * 4;
+                    let b_val = f32::from_le_bytes([
+                        input_bytes_b[b_idx],
+                        input_bytes_b[b_idx + 1],
+                        input_bytes_b[b_idx + 2],
+                        input_bytes_b[b_idx + 3],
+                    ]);
+
+                    sum += a_val * b_val;
+                }
+
+                output_bytes.extend_from_slice(&sum.to_le_bytes());
+            }
+        }
+
+        output.data = crate::ir::TensorData::Owned(output_bytes);
+
+        tracing::debug!("CPU MatMul: {}x{} @ {}x{} -> {}x{}", m, k, k, n, m, n);
         Ok(())
     }
 }
