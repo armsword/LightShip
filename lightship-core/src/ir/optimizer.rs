@@ -343,6 +343,7 @@ impl FusionPass {
                 FusionType::AddReLU,
                 FusionType::ConvBatchNorm,
                 FusionType::BatchNormReLU,
+                FusionType::MulReLU,
             ],
         }
     }
@@ -395,6 +396,16 @@ impl FusionPass {
                         if self.has_single_consumer(graph, &consumer) {
                             if self.fusion_types.contains(&FusionType::BatchNormReLU) {
                                 candidates.push((node.id, consumer.id, FusionType::BatchNormReLU));
+                            }
+                        }
+                    }
+                }
+                OperatorType::Mul => {
+                    // Look for ReLU/ReLU6 consumers (Mul + ReLU fusion)
+                    if let Some(consumer) = self.find_relu_consumer(graph, node) {
+                        if self.has_single_consumer(graph, &consumer) {
+                            if self.fusion_types.contains(&FusionType::MulReLU) {
+                                candidates.push((node.id, consumer.id, FusionType::MulReLU));
                             }
                         }
                     }
@@ -620,6 +631,52 @@ impl FusionPass {
         // Remove the ReLU node
         graph.retain_nodes(|n| n.id != relu_id);
     }
+
+    /// Fuse Mul + ReLU into a single Mul node with fusion info
+    ///
+    /// This performs a "lightweight" fusion where:
+    /// 1. The Mul node is marked with FusionInfo indicating Mul+ReLU fusion
+    /// 2. Consumers of ReLU are redirected to use Mul's output
+    /// 3. The ReLU node is removed from the graph
+    fn fuse_mul_relu(&self, graph: &mut Graph, mul_id: NodeId, relu_id: NodeId) {
+        // First, collect all the information we need
+        let (relu_output, mul_output) = {
+            let relu_out = graph.nodes.iter()
+                .find(|n| n.id == relu_id)
+                .and_then(|n| n.outputs.first())
+                .map(|o| o.tensor_name.clone());
+
+            let mul_out = graph.nodes.iter()
+                .find(|n| n.id == mul_id)
+                .and_then(|n| n.outputs.first())
+                .map(|o| o.tensor_name.clone());
+
+            (relu_out, mul_out)
+        };
+
+        // Update the Mul node's fusion info
+        if let Some(mul_node) = graph.nodes.iter_mut().find(|n| n.id == mul_id) {
+            let fusion_info = FusionInfo::new(
+                FusionType::MulReLU,
+                vec![OperatorType::Mul, OperatorType::ReLU],
+            );
+            mul_node.fusion = Some(fusion_info);
+        }
+
+        // Update consumers of relu_output to use mul_output
+        if let (Some(relu_out), Some(mul_out)) = (relu_output, mul_output) {
+            for node in &mut graph.nodes {
+                for input in &mut node.inputs {
+                    if input.tensor_name == relu_out {
+                        input.tensor_name = mul_out.clone();
+                    }
+                }
+            }
+        }
+
+        // Remove the ReLU node
+        graph.retain_nodes(|n| n.id != relu_id);
+    }
 }
 
 impl GraphOptimizer for FusionPass {
@@ -641,6 +698,9 @@ impl GraphOptimizer for FusionPass {
                 }
                 FusionType::BatchNormReLU => {
                     self.fuse_batchnorm_relu(graph, producer_id, consumer_id);
+                }
+                FusionType::MulReLU => {
+                    self.fuse_mul_relu(graph, producer_id, consumer_id);
                 }
                 _ => {}
             }
@@ -697,6 +757,10 @@ mod tests {
 
     fn add_batchnorm_node(graph: &mut Graph, name: &str, input: &str) -> NodeId {
         add_generic_node(graph, name, OperatorType::BatchNorm, vec![input], vec![&format!("{}_output", name)])
+    }
+
+    fn add_mul_node(graph: &mut Graph, name: &str, input1: &str, input2: &str) -> NodeId {
+        add_generic_node(graph, name, OperatorType::Mul, vec![input1, input2], vec![&format!("{}_output", name)])
     }
 
     #[test]
@@ -941,5 +1005,68 @@ mod tests {
         assert!(output_node.is_some());
         let output = output_node.unwrap();
         assert_eq!(output.inputs[0].tensor_name, "bn_output");
+    }
+
+    #[test]
+    fn test_find_mul_relu_fusion() {
+        let fusion = FusionPass::new();
+        let mut graph = create_test_graph();
+
+        // Create: Mul -> ReLU
+        let mul_id = add_mul_node(&mut graph, "mul", "input1", "input2");
+        let _relu_id = add_relu_node(&mut graph, "relu", "mul_output");
+
+        // Add an output consumer
+        let _output_node = add_generic_node(&mut graph, "output", OperatorType::Reshape, vec!["relu_output"], vec!["final_output"]);
+
+        let candidates = fusion.find_fusion_candidates(&graph);
+        assert!(candidates.iter().any(|(_, _, ft)| *ft == FusionType::MulReLU));
+    }
+
+    #[test]
+    fn test_mul_relu_fusion() {
+        let fusion = FusionPass::new();
+        let mut graph = create_test_graph();
+
+        // Create: Mul -> ReLU
+        let mul_id = add_mul_node(&mut graph, "mul", "input1", "input2");
+        let relu_id = add_relu_node(&mut graph, "relu", "mul_output");
+
+        // Add an output consumer
+        let _output_node = add_generic_node(&mut graph, "output", OperatorType::Reshape, vec!["relu_output"], vec!["final_output"]);
+
+        // Apply fusion
+        fusion.optimize(&mut graph);
+
+        // Check that ReLU is removed
+        let relu_exists = graph.nodes.iter().any(|n| n.id == relu_id);
+        assert!(!relu_exists, "ReLU node should be removed after fusion");
+
+        // Check that Mul has fusion info
+        let mul_node = graph.nodes.iter().find(|n| n.id == mul_id);
+        assert!(mul_node.is_some());
+        let mul = mul_node.unwrap();
+        assert!(mul.fusion.is_some());
+        assert_eq!(mul.fusion.as_ref().unwrap().fusion_type, FusionType::MulReLU);
+    }
+
+    #[test]
+    fn test_mul_relu_fusion_eliminates_relu() {
+        let fusion = FusionPass::new();
+        let mut graph = create_test_graph();
+
+        // Create: Mul -> ReLU -> Output
+        let _mul_id = add_mul_node(&mut graph, "mul", "input1", "input2");
+        let _relu_id = add_relu_node(&mut graph, "relu", "mul_output");
+        let output_id = add_generic_node(&mut graph, "output", OperatorType::Reshape, vec!["relu_output"], vec!["final_output"]);
+
+        // Apply fusion
+        fusion.optimize(&mut graph);
+
+        // The output node's input should now be mul_output instead of relu_output
+        let output_node = graph.nodes.iter().find(|n| n.id == output_id);
+        assert!(output_node.is_some());
+        let output = output_node.unwrap();
+        assert_eq!(output.inputs[0].tensor_name, "mul_output");
     }
 }
