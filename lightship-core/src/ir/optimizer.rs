@@ -319,3 +319,356 @@ impl Default for ShapeInference {
         Self::new()
     }
 }
+
+/// Operator fusion optimization
+///
+/// Fuses sequential operators into a single fused operator for better performance.
+/// Supported fusions:
+/// - Conv + ReLU
+/// - Conv + ReLU6
+/// - Add + ReLU (residual connections)
+#[derive(Debug)]
+pub struct FusionPass {
+    /// Types of fusion to apply
+    fusion_types: Vec<FusionType>,
+}
+
+impl FusionPass {
+    /// Create a new fusion pass
+    pub fn new() -> Self {
+        Self {
+            fusion_types: vec![
+                FusionType::ConvReLU,
+                FusionType::ConvReLU6,
+                FusionType::AddReLU,
+            ],
+        }
+    }
+
+    /// Create a fusion pass with specific fusion types
+    pub fn with_types(fusion_types: Vec<FusionType>) -> Self {
+        Self { fusion_types }
+    }
+
+    /// Find candidate fusion patterns in the graph
+    fn find_fusion_candidates(&self, graph: &Graph) -> Vec<(NodeId, NodeId, FusionType)> {
+        let mut candidates = Vec::new();
+
+        for i in 0..graph.nodes.len() {
+            let node = &graph.nodes[i];
+
+            // Check if this node can be a fusion producer
+            match node.operator_type {
+                OperatorType::Conv2d | OperatorType::Add => {
+                    // Look for ReLU/ReLU6 consumers
+                    if let Some(consumer) = self.find_relu_consumer(graph, node) {
+                        // Only fuse if the ReLU node itself has exactly one consumer
+                        // If ReLU has multiple consumers, we can't fuse without breaking the graph
+                        if !self.has_single_consumer(graph, &consumer) {
+                            continue;
+                        }
+
+                        if node.operator_type == OperatorType::Conv2d {
+                            candidates.push((node.id, consumer.id, FusionType::ConvReLU));
+                        } else if node.operator_type == OperatorType::Add {
+                            candidates.push((node.id, consumer.id, FusionType::AddReLU));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        candidates
+    }
+
+    /// Find a ReLU/ReLU6 consumer of this node's output
+    fn find_relu_consumer(&self, graph: &Graph, producer: &Node) -> Option<Node> {
+        let output_name = producer.outputs.first()?.tensor_name.clone();
+
+        // Find nodes that consume this output
+        for node in &graph.nodes {
+            if node.inputs.iter().any(|i| i.tensor_name == output_name) {
+                // Check if it's a ReLU or ReLU6
+                if matches!(node.operator_type, OperatorType::ReLU | OperatorType::ReLU6) {
+                    return Some(node.clone());
+                }
+            }
+        }
+        None
+    }
+
+    /// Check if a node has only one consumer
+    fn has_single_consumer(&self, graph: &Graph, node: &Node) -> bool {
+        let output_name = node.outputs.first().map(|o| o.tensor_name.clone());
+        if let Some(name) = output_name {
+            graph.nodes.iter().filter(|n| n.inputs.iter().any(|i| i.tensor_name == name)).count() == 1
+        } else {
+            false
+        }
+    }
+
+    /// Fuse Conv + ReLU into a single Conv node with fusion info
+    fn fuse_conv_relu(&self, graph: &mut Graph, conv_id: NodeId, relu_id: NodeId) {
+        // First, collect all the information we need
+        let (relu_output, conv_output) = {
+            let relu_out = graph.nodes.iter()
+                .find(|n| n.id == relu_id)
+                .and_then(|n| n.outputs.first())
+                .map(|o| o.tensor_name.clone());
+
+            let conv_out = graph.nodes.iter()
+                .find(|n| n.id == conv_id)
+                .and_then(|n| n.outputs.first())
+                .map(|o| o.tensor_name.clone());
+
+            (relu_out, conv_out)
+        };
+
+        // Now update the Conv node's fusion info
+        if let Some(conv_node) = graph.nodes.iter_mut().find(|n| n.id == conv_id) {
+            let fusion_info = FusionInfo::conv_relu();
+            conv_node.fusion = Some(fusion_info);
+        }
+
+        // Update consumers of relu_output to use conv_output
+        if let (Some(relu_out), Some(conv_out)) = (relu_output, conv_output) {
+            for node in &mut graph.nodes {
+                for input in &mut node.inputs {
+                    if input.tensor_name == relu_out {
+                        input.tensor_name = conv_out.clone();
+                    }
+                }
+            }
+        }
+
+        // Remove the ReLU node
+        graph.retain_nodes(|n| n.id != relu_id);
+    }
+
+    /// Fuse Add + ReLU for residual connections
+    fn fuse_add_relu(&self, graph: &mut Graph, add_id: NodeId, relu_id: NodeId) {
+        // First, collect all the information we need
+        let (relu_output, add_output) = {
+            let relu_out = graph.nodes.iter()
+                .find(|n| n.id == relu_id)
+                .and_then(|n| n.outputs.first())
+                .map(|o| o.tensor_name.clone());
+
+            let add_out = graph.nodes.iter()
+                .find(|n| n.id == add_id)
+                .and_then(|n| n.outputs.first())
+                .map(|o| o.tensor_name.clone());
+
+            (relu_out, add_out)
+        };
+
+        // Now update the Add node's fusion info
+        if let Some(add_node) = graph.nodes.iter_mut().find(|n| n.id == add_id) {
+            let fusion_info = FusionInfo::new(
+                FusionType::AddReLU,
+                vec![OperatorType::Add, OperatorType::ReLU],
+            );
+            add_node.fusion = Some(fusion_info);
+        }
+
+        // Update consumers of relu_output to use add_output
+        if let (Some(relu_out), Some(add_out)) = (relu_output, add_output) {
+            for node in &mut graph.nodes {
+                for input in &mut node.inputs {
+                    if input.tensor_name == relu_out {
+                        input.tensor_name = add_out.clone();
+                    }
+                }
+            }
+        }
+
+        // Remove the ReLU node
+        graph.retain_nodes(|n| n.id != relu_id);
+    }
+}
+
+impl GraphOptimizer for FusionPass {
+    fn optimize(&self, graph: &mut Graph) {
+        // Find all fusion candidates
+        let candidates = self.find_fusion_candidates(graph);
+
+        // Apply each fusion
+        for (producer_id, consumer_id, fusion_type) in candidates {
+            match fusion_type {
+                FusionType::ConvReLU | FusionType::ConvReLU6 => {
+                    self.fuse_conv_relu(graph, producer_id, consumer_id);
+                }
+                FusionType::AddReLU => {
+                    self.fuse_add_relu(graph, producer_id, consumer_id);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        "FusionPass"
+    }
+}
+
+impl Default for FusionPass {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::DataType;
+    use crate::ir::{Graph, Node, NodeIO, OperatorType};
+
+    fn create_test_graph() -> Graph {
+        Graph::new("test".to_string())
+    }
+
+    fn make_node_io(name: &str) -> NodeIO {
+        NodeIO {
+            tensor_name: name.to_string(),
+            data_type: DataType::F32,
+        }
+    }
+
+    fn add_generic_node(graph: &mut Graph, name: &str, op_type: OperatorType, inputs: Vec<&str>, outputs: Vec<&str>) -> NodeId {
+        let next_id = graph.nodes.len() as NodeId;
+        let mut node = Node::new(next_id, name.to_string(), op_type);
+        node.inputs = inputs.iter().map(|s| make_node_io(s)).collect();
+        node.outputs = outputs.iter().map(|s| make_node_io(s)).collect();
+        graph.add_node(node)
+    }
+
+    fn add_conv_node(graph: &mut Graph, name: &str) -> NodeId {
+        add_generic_node(graph, name, OperatorType::Conv2d, vec!["input"], vec![&format!("{}_output", name)])
+    }
+
+    fn add_relu_node(graph: &mut Graph, name: &str, input: &str) -> NodeId {
+        add_generic_node(graph, name, OperatorType::ReLU, vec![input], vec![&format!("{}_output", name)])
+    }
+
+    fn add_add_node(graph: &mut Graph, name: &str, input1: &str, input2: &str) -> NodeId {
+        add_generic_node(graph, name, OperatorType::Add, vec![input1, input2], vec![&format!("{}_output", name)])
+    }
+
+    #[test]
+    fn test_fusion_pass_creation() {
+        let fusion = FusionPass::new();
+        assert_eq!(fusion.name(), "FusionPass");
+    }
+
+    #[test]
+    fn test_fusion_pass_with_types() {
+        let fusion = FusionPass::with_types(vec![FusionType::ConvReLU]);
+        assert_eq!(fusion.name(), "FusionPass");
+    }
+
+    #[test]
+    fn test_find_conv_relu_fusion() {
+        let fusion = FusionPass::new();
+        let mut graph = create_test_graph();
+
+        // Create: Conv -> ReLU
+        let conv_id = add_conv_node(&mut graph, "conv");
+        let _relu_id = add_relu_node(&mut graph, "relu", "conv_output");
+
+        // Add an output consumer
+        let _output_node = add_generic_node(&mut graph, "output", OperatorType::Reshape, vec!["relu_output"], vec!["final_output"]);
+
+        let candidates = fusion.find_fusion_candidates(&graph);
+        assert!(candidates.iter().any(|(_, _, ft)| *ft == FusionType::ConvReLU));
+    }
+
+    #[test]
+    fn test_find_add_relu_fusion() {
+        let fusion = FusionPass::new();
+        let mut graph = create_test_graph();
+
+        // Create: Add -> ReLU (residual connection pattern)
+        let add_id = add_add_node(&mut graph, "add", "input1", "input2");
+        let _relu_id = add_relu_node(&mut graph, "relu", "add_output");
+
+        // Add an output consumer
+        let _output_node = add_generic_node(&mut graph, "output", OperatorType::Reshape, vec!["relu_output"], vec!["final_output"]);
+
+        let candidates = fusion.find_fusion_candidates(&graph);
+        assert!(candidates.iter().any(|(_, _, ft)| *ft == FusionType::AddReLU));
+    }
+
+    #[test]
+    fn test_conv_relu_fusion() {
+        let fusion = FusionPass::new();
+        let mut graph = create_test_graph();
+
+        // Create: Conv -> ReLU
+        let conv_id = add_conv_node(&mut graph, "conv");
+        let relu_id = add_relu_node(&mut graph, "relu", "conv_output");
+
+        // Add an output consumer
+        let _output_node = add_generic_node(&mut graph, "output", OperatorType::Reshape, vec!["relu_output"], vec!["final_output"]);
+
+        // Apply fusion
+        fusion.optimize(&mut graph);
+
+        // Check that ReLU is removed
+        let relu_exists = graph.nodes.iter().any(|n| n.id == relu_id);
+        assert!(!relu_exists, "ReLU node should be removed after fusion");
+
+        // Check that Conv has fusion info
+        let conv_node = graph.nodes.iter().find(|n| n.id == conv_id);
+        assert!(conv_node.is_some());
+        let conv = conv_node.unwrap();
+        assert!(conv.fusion.is_some());
+        assert_eq!(conv.fusion.as_ref().unwrap().fusion_type, FusionType::ConvReLU);
+    }
+
+    #[test]
+    fn test_add_relu_fusion() {
+        let fusion = FusionPass::new();
+        let mut graph = create_test_graph();
+
+        // Create: Add -> ReLU
+        let add_id = add_add_node(&mut graph, "add", "input1", "input2");
+        let relu_id = add_relu_node(&mut graph, "relu", "add_output");
+
+        // Add an output consumer
+        let _output_node = add_generic_node(&mut graph, "output", OperatorType::Reshape, vec!["relu_output"], vec!["final_output"]);
+
+        // Apply fusion
+        fusion.optimize(&mut graph);
+
+        // Check that ReLU is removed
+        let relu_exists = graph.nodes.iter().any(|n| n.id == relu_id);
+        assert!(!relu_exists, "ReLU node should be removed after fusion");
+
+        // Check that Add has fusion info
+        let add_node = graph.nodes.iter().find(|n| n.id == add_id);
+        assert!(add_node.is_some());
+        let add = add_node.unwrap();
+        assert!(add.fusion.is_some());
+        assert_eq!(add.fusion.as_ref().unwrap().fusion_type, FusionType::AddReLU);
+    }
+
+    #[test]
+    fn test_fusion_skips_multi_consumer() {
+        let fusion = FusionPass::new();
+        let mut graph = create_test_graph();
+
+        // Create: Conv -> ReLU -> (consumer1, consumer2)
+        let _conv_id = add_conv_node(&mut graph, "conv");
+        let _relu_id = add_relu_node(&mut graph, "relu", "conv_output");
+
+        // Two consumers of ReLU
+        let _consumer1 = add_generic_node(&mut graph, "consumer1", OperatorType::Reshape, vec!["relu_output"], vec!["output1"]);
+        let _consumer2 = add_generic_node(&mut graph, "consumer2", OperatorType::Reshape, vec!["relu_output"], vec!["output2"]);
+
+        let candidates = fusion.find_fusion_candidates(&graph);
+
+        // Should not find fusion candidate because ReLU has multiple consumers
+        assert!(candidates.is_empty());
+    }
+}

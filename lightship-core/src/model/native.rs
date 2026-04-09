@@ -419,6 +419,7 @@ impl NativeSerializer {
             operator_type: op_type,
             inputs,
             outputs,
+            fusion: None,
         }, pos))
     }
 

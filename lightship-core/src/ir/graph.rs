@@ -2,6 +2,7 @@
 
 use super::operator::OperatorType;
 use super::tensor::Tensor;
+use super::FusionInfo;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
@@ -43,6 +44,8 @@ pub struct Node {
     pub inputs: Vec<NodeIO>,
     /// Output references
     pub outputs: Vec<NodeIO>,
+    /// Fusion information (if this node is fused with others)
+    pub fusion: Option<FusionInfo>,
 }
 
 impl Node {
@@ -54,6 +57,7 @@ impl Node {
             operator_type,
             inputs: Vec::new(),
             outputs: Vec::new(),
+            fusion: None,
         }
     }
 }

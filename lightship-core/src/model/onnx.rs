@@ -376,6 +376,7 @@ impl OnnxLoader {
             operator_type,
             inputs,
             outputs,
+            fusion: None,
         }, current_offset))
     }
 
