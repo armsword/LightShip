@@ -147,9 +147,13 @@ impl Backend for CpuBackend {
     ) -> Result<()> {
         match op.operator_type {
             OperatorType::ReLU => self.execute_relu(inputs, outputs),
+            OperatorType::ReLU6 => self.execute_relu6(inputs, outputs),
             OperatorType::Add => self.execute_add(inputs, outputs),
             OperatorType::Mul => self.execute_mul(inputs, outputs),
             OperatorType::Sigmoid => self.execute_sigmoid(inputs, outputs),
+            OperatorType::Tanh => self.execute_tanh(inputs, outputs),
+            OperatorType::MaxPool2d => self.execute_maxpool2d(inputs, outputs),
+            OperatorType::AvgPool2d => self.execute_avgpool2d(inputs, outputs),
             _ => {
                 tracing::debug!(
                     "CPU backend: operator {:?} execution not yet implemented",
@@ -333,6 +337,212 @@ impl CpuBackend {
         output.data = crate::ir::TensorData::Owned(output_bytes);
 
         tracing::debug!("CPU Sigmoid: executed {} elements", input_bytes.len() / 4);
+        Ok(())
+    }
+
+    fn execute_tanh(&self, inputs: &[&Tensor], outputs: &mut [&mut Tensor]) -> Result<()> {
+        if inputs.is_empty() || outputs.is_empty() {
+            return Err(LightShipError::InvalidParam("Missing input or output".into()));
+        }
+
+        let input = inputs[0];
+        let output = &mut outputs[0];
+
+        if input.data_type != DataType::F32 {
+            return Err(LightShipError::Backend(
+                BackendError::UnsupportedDataType(format!("{:?}", input.data_type)),
+            ));
+        }
+
+        let input_bytes = input.data_as_bytes();
+
+        // tanh(x) = (exp(x) - exp(-x)) / (exp(x) + exp(-x))
+        // Rust std library provides tanh directly
+        let mut output_bytes = Vec::with_capacity(input_bytes.len());
+        for chunk in input_bytes.chunks_exact(4) {
+            let x = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            let result = x.tanh();
+            output_bytes.extend_from_slice(&result.to_le_bytes());
+        }
+
+        output.data = crate::ir::TensorData::Owned(output_bytes);
+
+        tracing::debug!("CPU Tanh: executed {} elements", input_bytes.len() / 4);
+        Ok(())
+    }
+
+    fn execute_relu6(&self, inputs: &[&Tensor], outputs: &mut [&mut Tensor]) -> Result<()> {
+        if inputs.is_empty() || outputs.is_empty() {
+            return Err(LightShipError::InvalidParam("Missing input or output".into()));
+        }
+
+        let input = inputs[0];
+        let output = &mut outputs[0];
+
+        if input.data_type != DataType::F32 {
+            return Err(LightShipError::Backend(
+                BackendError::UnsupportedDataType(format!("{:?}", input.data_type)),
+            ));
+        }
+
+        let input_bytes = input.data_as_bytes();
+
+        // ReLU6: min(max(x, 0), 6)
+        let mut output_bytes = Vec::with_capacity(input_bytes.len());
+        for chunk in input_bytes.chunks_exact(4) {
+            let value = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            let result = value.max(0.0).min(6.0);
+            output_bytes.extend_from_slice(&result.to_le_bytes());
+        }
+
+        output.data = crate::ir::TensorData::Owned(output_bytes);
+
+        tracing::debug!("CPU ReLU6: executed {} elements", input_bytes.len() / 4);
+        Ok(())
+    }
+
+    fn execute_maxpool2d(&self, inputs: &[&Tensor], outputs: &mut [&mut Tensor]) -> Result<()> {
+        if inputs.is_empty() || outputs.is_empty() {
+            return Err(LightShipError::InvalidParam("Missing input or output".into()));
+        }
+
+        let input = inputs[0];
+        let output = &mut outputs[0];
+
+        if input.data_type != DataType::F32 {
+            return Err(LightShipError::Backend(
+                BackendError::UnsupportedDataType(format!("{:?}", input.data_type)),
+            ));
+        }
+
+        // Assume NCHW format: [batch, channels, height, width]
+        if input.shape.len() != 4 {
+            return Err(LightShipError::InvalidParam("MaxPool2d requires 4D NCHW input".into()));
+        }
+
+        let [batch, channels, height, width] = &input.shape[..4] else {
+            return Err(LightShipError::InvalidParam("Invalid input shape".into()));
+        };
+
+        // Assume kernel=2, stride=2 for simplicity
+        let kernel = 2;
+        let stride = 2;
+        let out_h = (height + 2 * 0 - kernel) / stride + 1;
+        let out_w = (width + 2 * 0 - kernel) / stride + 1;
+
+        let input_bytes = input.data_as_bytes();
+
+        // For each output element, find max in kernel window
+        let mut output_bytes = Vec::with_capacity(batch * channels * out_h * out_w * 4);
+
+        for b in 0..*batch {
+            for c in 0..*channels {
+                for oh in 0..out_h {
+                    for ow in 0..out_w {
+                        let mut max_val = f32::NEG_INFINITY;
+
+                        for kh in 0..kernel {
+                            for kw in 0..kernel {
+                                let ih = oh * stride + kh;
+                                let iw = ow * stride + kw;
+
+                                if ih < *height && iw < *width {
+                                    let idx = ((b * channels + c) * height + ih) * width + iw;
+                                    let chunk_start = idx * 4;
+                                    let val = f32::from_le_bytes([
+                                        input_bytes[chunk_start],
+                                        input_bytes[chunk_start + 1],
+                                        input_bytes[chunk_start + 2],
+                                        input_bytes[chunk_start + 3],
+                                    ]);
+                                    max_val = max_val.max(val);
+                                }
+                            }
+                        }
+
+                        output_bytes.extend_from_slice(&max_val.to_le_bytes());
+                    }
+                }
+            }
+        }
+
+        output.data = crate::ir::TensorData::Owned(output_bytes);
+
+        tracing::debug!("CPU MaxPool2d: output shape=[{}, {}, {}, {}]", batch, channels, out_h, out_w);
+        Ok(())
+    }
+
+    fn execute_avgpool2d(&self, inputs: &[&Tensor], outputs: &mut [&mut Tensor]) -> Result<()> {
+        if inputs.is_empty() || outputs.is_empty() {
+            return Err(LightShipError::InvalidParam("Missing input or output".into()));
+        }
+
+        let input = inputs[0];
+        let output = &mut outputs[0];
+
+        if input.data_type != DataType::F32 {
+            return Err(LightShipError::Backend(
+                BackendError::UnsupportedDataType(format!("{:?}", input.data_type)),
+            ));
+        }
+
+        // Assume NCHW format: [batch, channels, height, width]
+        if input.shape.len() != 4 {
+            return Err(LightShipError::InvalidParam("AvgPool2d requires 4D NCHW input".into()));
+        }
+
+        let [batch, channels, height, width] = &input.shape[..4] else {
+            return Err(LightShipError::InvalidParam("Invalid input shape".into()));
+        };
+
+        // Assume kernel=2, stride=2 for simplicity
+        let kernel = 2;
+        let stride = 2;
+        let out_h = (height + 2 * 0 - kernel) / stride + 1;
+        let out_w = (width + 2 * 0 - kernel) / stride + 1;
+
+        let input_bytes = input.data_as_bytes();
+
+        // For each output element, compute average in kernel window
+        let mut output_bytes = Vec::with_capacity(batch * channels * out_h * out_w * 4);
+
+        for b in 0..*batch {
+            for c in 0..*channels {
+                for oh in 0..out_h {
+                    for ow in 0..out_w {
+                        let mut sum = 0.0f32;
+                        let mut count = 0.0f32;
+
+                        for kh in 0..kernel {
+                            for kw in 0..kernel {
+                                let ih = oh * stride + kh;
+                                let iw = ow * stride + kw;
+
+                                if ih < *height && iw < *width {
+                                    let idx = ((b * channels + c) * height + ih) * width + iw;
+                                    let chunk_start = idx * 4;
+                                    let val = f32::from_le_bytes([
+                                        input_bytes[chunk_start],
+                                        input_bytes[chunk_start + 1],
+                                        input_bytes[chunk_start + 2],
+                                        input_bytes[chunk_start + 3],
+                                    ]);
+                                    sum += val;
+                                    count += 1.0;
+                                }
+                            }
+                        }
+
+                        let avg = if count > 0.0 { sum / count } else { 0.0 };
+                        output_bytes.extend_from_slice(&avg.to_le_bytes());
+                    }
+                }
+            }
+        }
+
+        output.data = crate::ir::TensorData::Owned(output_bytes);
+
+        tracing::debug!("CPU AvgPool2d: output shape=[{}, {}, {}, {}]", batch, channels, out_h, out_w);
         Ok(())
     }
 }

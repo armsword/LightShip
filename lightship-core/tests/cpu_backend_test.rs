@@ -268,3 +268,172 @@ fn test_cpu_backend_execute_sigmoid() {
     assert!((output_data[1] - 0.73105858).abs() < tolerance);
     assert!((output_data[2] - 0.26894142).abs() < tolerance);
 }
+
+#[test]
+fn test_cpu_backend_execute_tanh() {
+    let backend = CpuBackend::new();
+
+    let mut op_def = OperatorDef::new("tanh".into(), OperatorType::Tanh);
+    op_def.inputs.push(NodeIO {
+        tensor_name: "input".into(),
+        data_type: DataType::F32,
+    });
+    op_def.outputs.push(NodeIO {
+        tensor_name: "output".into(),
+        data_type: DataType::F32,
+    });
+
+    // Create input: [0.0, 1.0, -1.0]
+    // tanh(0) = 0, tanh(1) ≈ 0.761594, tanh(-1) ≈ -0.761594
+    let input = Tensor::from_data(
+        "input".into(),
+        vec![3],
+        DataType::F32,
+        vec![0.0f32, 1.0, -1.0],
+    );
+    let mut output = Tensor::new("output".into(), vec![3], DataType::F32);
+
+    let compiled = backend
+        .compile_operator(&op_def, &[&input], &[&output])
+        .unwrap();
+
+    let result = backend.execute(&compiled, &[&input], &mut [&mut output]);
+    assert!(result.is_ok());
+
+    // Verify tanh output
+    let bytes = output.data_as_bytes();
+    let output_data: Vec<f32> = bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+
+    let tolerance = 0.001;
+    assert!((output_data[0] - 0.0).abs() < tolerance);
+    assert!((output_data[1] - 0.761594).abs() < tolerance);
+    assert!((output_data[2] - (-0.761594)).abs() < tolerance);
+}
+
+#[test]
+fn test_cpu_backend_execute_relu6() {
+    let backend = CpuBackend::new();
+
+    let mut op_def = OperatorDef::new("relu6".into(), OperatorType::ReLU6);
+    op_def.inputs.push(NodeIO {
+        tensor_name: "input".into(),
+        data_type: DataType::F32,
+    });
+    op_def.outputs.push(NodeIO {
+        tensor_name: "output".into(),
+        data_type: DataType::F32,
+    });
+
+    // Create input: [-2.0, -1.0, 0.0, 1.0, 3.0, 6.0, 8.0]
+    // ReLU6: min(max(x, 0), 6) = [0, 0, 0, 1, 3, 6, 6]
+    let input = Tensor::from_data(
+        "input".into(),
+        vec![7],
+        DataType::F32,
+        vec![-2.0f32, -1.0, 0.0, 1.0, 3.0, 6.0, 8.0],
+    );
+    let mut output = Tensor::new("output".into(), vec![7], DataType::F32);
+
+    let compiled = backend
+        .compile_operator(&op_def, &[&input], &[&output])
+        .unwrap();
+
+    let result = backend.execute(&compiled, &[&input], &mut [&mut output]);
+    assert!(result.is_ok());
+
+    // Verify ReLU6 output
+    let bytes = output.data_as_bytes();
+    let output_data: Vec<f32> = bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    assert_eq!(output_data, &[0.0, 0.0, 0.0, 1.0, 3.0, 6.0, 6.0]);
+}
+
+#[test]
+fn test_cpu_backend_execute_maxpool2d() {
+    let backend = CpuBackend::new();
+
+    let mut op_def = OperatorDef::new("maxpool".into(), OperatorType::MaxPool2d);
+    op_def.inputs.push(NodeIO {
+        tensor_name: "input".into(),
+        data_type: DataType::F32,
+    });
+    op_def.outputs.push(NodeIO {
+        tensor_name: "output".into(),
+        data_type: DataType::F32,
+    });
+
+    // Create 2x2 input:
+    // [1.0, 2.0]
+    // [3.0, 4.0]
+    // MaxPool with kernel=2, stride=2 should give [4.0]
+    let input = Tensor::from_data(
+        "input".into(),
+        vec![1, 1, 2, 2],  // NCHW: batch=1, channels=1, height=2, width=2
+        DataType::F32,
+        vec![1.0f32, 2.0, 3.0, 4.0],
+    );
+    let mut output = Tensor::new("output".into(), vec![1, 1, 1, 1], DataType::F32);
+
+    let compiled = backend
+        .compile_operator(&op_def, &[&input], &[&output])
+        .unwrap();
+
+    let result = backend.execute(&compiled, &[&input], &mut [&mut output]);
+    assert!(result.is_ok());
+
+    // Verify MaxPool2d output: max of all elements = 4.0
+    let bytes = output.data_as_bytes();
+    let output_data: Vec<f32> = bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    assert_eq!(output_data, &[4.0]);
+}
+
+#[test]
+fn test_cpu_backend_execute_avgpool2d() {
+    let backend = CpuBackend::new();
+
+    let mut op_def = OperatorDef::new("avgpool".into(), OperatorType::AvgPool2d);
+    op_def.inputs.push(NodeIO {
+        tensor_name: "input".into(),
+        data_type: DataType::F32,
+    });
+    op_def.outputs.push(NodeIO {
+        tensor_name: "output".into(),
+        data_type: DataType::F32,
+    });
+
+    // Create 2x2 input:
+    // [1.0, 2.0]
+    // [3.0, 4.0]
+    // AvgPool with kernel=2, stride=2 should give [(1+2+3+4)/4] = [2.5]
+    let input = Tensor::from_data(
+        "input".into(),
+        vec![1, 1, 2, 2],
+        DataType::F32,
+        vec![1.0f32, 2.0, 3.0, 4.0],
+    );
+    let mut output = Tensor::new("output".into(), vec![1, 1, 1, 1], DataType::F32);
+
+    let compiled = backend
+        .compile_operator(&op_def, &[&input], &[&output])
+        .unwrap();
+
+    let result = backend.execute(&compiled, &[&input], &mut [&mut output]);
+    assert!(result.is_ok());
+
+    // Verify AvgPool2d output: average = 2.5
+    let bytes = output.data_as_bytes();
+    let output_data: Vec<f32> = bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    let tolerance = 0.001;
+    assert!((output_data[0] - 2.5).abs() < tolerance);
+}
