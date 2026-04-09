@@ -143,7 +143,7 @@ pub trait Backend: Send + Sync {
         &self,
         op: &CompiledOperator,
         inputs: &[&Tensor],
-        outputs: &mut [&Tensor],
+        outputs: &mut [&mut Tensor],
     ) -> Result<()>;
 
     /// Allocate memory on this backend

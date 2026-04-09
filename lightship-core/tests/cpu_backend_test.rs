@@ -93,8 +93,14 @@ fn test_cpu_backend_execute_relu() {
         data_type: DataType::F32,
     });
 
-    let input = Tensor::new("input".into(), vec![1, 3, 224, 224], DataType::F32);
-    let mut output = Tensor::new("output".into(), vec![1, 3, 224, 224], DataType::F32);
+    // Create input tensor with known values: [-1.0, 0.0, 1.0, 2.0]
+    let input = Tensor::from_data(
+        "input".into(),
+        vec![4],
+        DataType::F32,
+        vec![-1.0f32, 0.0, 1.0, 2.0],
+    );
+    let mut output = Tensor::new("output".into(), vec![4], DataType::F32);
 
     let compiled = backend
         .compile_operator(&op_def, &[&input], &[&output])
@@ -102,6 +108,14 @@ fn test_cpu_backend_execute_relu() {
 
     let result = backend.execute(&compiled, &[&input], &mut [&mut output]);
     assert!(result.is_ok());
+
+    // Verify ReLU output: max(x, 0) = [0.0, 0.0, 1.0, 2.0]
+    let bytes = output.data_as_bytes();
+    let output_data: Vec<f32> = bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    assert_eq!(output_data, &[0.0, 0.0, 1.0, 2.0]);
 }
 
 #[test]
@@ -122,9 +136,20 @@ fn test_cpu_backend_execute_add() {
         data_type: DataType::F32,
     });
 
-    let input_a = Tensor::new("a".into(), vec![1, 3, 224, 224], DataType::F32);
-    let input_b = Tensor::new("b".into(), vec![1, 3, 224, 224], DataType::F32);
-    let mut output = Tensor::new("c".into(), vec![1, 3, 224, 224], DataType::F32);
+    // Create input tensors with known values
+    let input_a = Tensor::from_data(
+        "a".into(),
+        vec![3],
+        DataType::F32,
+        vec![1.0f32, 2.0, 3.0],
+    );
+    let input_b = Tensor::from_data(
+        "b".into(),
+        vec![3],
+        DataType::F32,
+        vec![4.0f32, 5.0, 6.0],
+    );
+    let mut output = Tensor::new("c".into(), vec![3], DataType::F32);
 
     let compiled = backend
         .compile_operator(&op_def, &[&input_a, &input_b], &[&output])
@@ -132,6 +157,14 @@ fn test_cpu_backend_execute_add() {
 
     let result = backend.execute(&compiled, &[&input_a, &input_b], &mut [&mut output]);
     assert!(result.is_ok());
+
+    // Verify Add output: a + b = [5.0, 7.0, 9.0]
+    let bytes = output.data_as_bytes();
+    let output_data: Vec<f32> = bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    assert_eq!(output_data, &[5.0, 7.0, 9.0]);
 }
 
 #[test]

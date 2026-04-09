@@ -143,7 +143,7 @@ impl Backend for CpuBackend {
         &self,
         op: &CompiledOperator,
         inputs: &[&Tensor],
-        outputs: &mut [&Tensor],
+        outputs: &mut [&mut Tensor],
     ) -> Result<()> {
         match op.operator_type {
             OperatorType::ReLU => self.execute_relu(inputs, outputs),
@@ -200,7 +200,7 @@ impl Backend for CpuBackend {
 }
 
 impl CpuBackend {
-    fn execute_relu(&self, inputs: &[&Tensor], outputs: &mut [&Tensor]) -> Result<()> {
+    fn execute_relu(&self, inputs: &[&Tensor], outputs: &mut [&mut Tensor]) -> Result<()> {
         if inputs.is_empty() || outputs.is_empty() {
             return Err(LightShipError::InvalidParam("Missing input or output".into()));
         }
@@ -214,16 +214,57 @@ impl CpuBackend {
             ));
         }
 
-        tracing::debug!("CPU ReLU: input shape={:?}", input.shape);
+        // Get input data as bytes and compute ReLU
+        let input_bytes = input.data_as_bytes();
+        let num_elements = input_bytes.len() / 4;
+
+        // ReLU: max(x, 0)
+        let mut output_bytes = Vec::with_capacity(input_bytes.len());
+        for chunk in input_bytes.chunks_exact(4) {
+            let value = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            let result = if value > 0.0 { value } else { 0.0 };
+            output_bytes.extend_from_slice(&result.to_le_bytes());
+        }
+
+        output.data = crate::ir::TensorData::Owned(output_bytes);
+
+        tracing::debug!("CPU ReLU: input shape={:?}, elements={}", input.shape, num_elements);
         Ok(())
     }
 
-    fn execute_add(&self, inputs: &[&Tensor], outputs: &mut [&Tensor]) -> Result<()> {
+    fn execute_add(&self, inputs: &[&Tensor], outputs: &mut [&mut Tensor]) -> Result<()> {
         if inputs.len() < 2 || outputs.is_empty() {
             return Err(LightShipError::InvalidParam("Add requires 2 inputs and 1 output".into()));
         }
 
-        tracing::debug!("CPU Add: executing");
+        let input_a = inputs[0];
+        let input_b = inputs[1];
+        let output = &mut outputs[0];
+
+        if input_a.data_type != DataType::F32 || input_b.data_type != DataType::F32 {
+            return Err(LightShipError::Backend(
+                BackendError::UnsupportedDataType("Add requires F32 inputs".into()),
+            ));
+        }
+
+        let input_bytes_a = input_a.data_as_bytes();
+        let input_bytes_b = input_b.data_as_bytes();
+
+        if input_bytes_a.len() != input_bytes_b.len() {
+            return Err(LightShipError::InvalidParam("Add inputs must have same size".into()));
+        }
+
+        // Element-wise addition: a + b
+        let mut output_bytes = Vec::with_capacity(input_bytes_a.len());
+        for (chunk_a, chunk_b) in input_bytes_a.chunks_exact(4).zip(input_bytes_b.chunks_exact(4)) {
+            let a = f32::from_le_bytes([chunk_a[0], chunk_a[1], chunk_a[2], chunk_a[3]]);
+            let b = f32::from_le_bytes([chunk_b[0], chunk_b[1], chunk_b[2], chunk_b[3]]);
+            output_bytes.extend_from_slice(&(a + b).to_le_bytes());
+        }
+
+        output.data = crate::ir::TensorData::Owned(output_bytes);
+
+        tracing::debug!("CPU Add: executed {} elements", input_bytes_a.len() / 4);
         Ok(())
     }
 }
