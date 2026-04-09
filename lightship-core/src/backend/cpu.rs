@@ -5,6 +5,7 @@ use crate::backend::{
     Backend, BackendCapabilities, BackendSpecificData, CompiledOperator, CpuBackendConfig,
     MemoryBlock, SimdFlags,
 };
+use crate::operator::{Conv2d, Conv2dConfig};
 use crate::backend::memory::StorageLocation;
 use crate::common::{BackendType, DataType, LightShipError, Result, StorageLayout};
 use crate::common::error::BackendError;
@@ -160,6 +161,7 @@ impl Backend for CpuBackend {
             OperatorType::MatMul => self.execute_matmul(inputs, outputs),
             OperatorType::Reshape => self.execute_reshape(inputs, outputs),
             OperatorType::Transpose => self.execute_transpose(inputs, outputs),
+            OperatorType::Conv2d => self.execute_conv2d(inputs, outputs),
             _ => {
                 tracing::debug!(
                     "CPU backend: operator {:?} execution not yet implemented",
@@ -819,6 +821,46 @@ impl CpuBackend {
         output.data = crate::ir::TensorData::Owned(output_bytes);
 
         tracing::debug!("CPU Transpose: {:?} -> {:?}", input.shape, output.shape);
+        Ok(())
+    }
+
+    fn execute_conv2d(&self, inputs: &[&Tensor], outputs: &mut [&mut Tensor]) -> Result<()> {
+        if inputs.len() < 2 || outputs.is_empty() {
+            return Err(LightShipError::InvalidParam("Conv2d requires 2 inputs (input, filter) and 1 output".into()));
+        }
+
+        let input = inputs[0];
+        let filter = inputs[1];
+        let output = &mut outputs[0];
+
+        if input.data_type != DataType::F32 || filter.data_type != DataType::F32 {
+            return Err(LightShipError::Backend(
+                BackendError::UnsupportedDataType("Conv2d requires F32 inputs".into()),
+            ));
+        }
+
+        // Create Conv2d with default config
+        // Note: In production, config should come from OperatorDef.attributes
+        let config = Conv2dConfig {
+            out_channels: filter.shape[0],
+            kernel_h: filter.shape[2],
+            kernel_w: filter.shape[3],
+            stride_h: 1,
+            stride_w: 1,
+            pad_h: 0,
+            pad_w: 0,
+            dilation_h: 1,
+            dilation_w: 1,
+            groups: 1,
+        };
+
+        let conv = Conv2d::new(config);
+        let result = conv.forward(input, filter)?;
+
+        // Copy output data
+        output.data = result.data;
+
+        tracing::debug!("CPU Conv2d: input shape={:?}, filter shape={:?}", input.shape, filter.shape);
         Ok(())
     }
 }

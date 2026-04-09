@@ -748,3 +748,63 @@ fn test_cpu_backend_execute_transpose() {
     // Row 0: [1, 4], Row 1: [2, 5], Row 2: [3, 6]
     assert_eq!(output_data, &[1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
 }
+
+#[test]
+fn test_cpu_backend_execute_conv2d() {
+    let backend = CpuBackend::new();
+
+    let mut op_def = OperatorDef::new("conv".into(), OperatorType::Conv2d);
+    op_def.inputs.push(NodeIO {
+        tensor_name: "input".into(),
+        data_type: DataType::F32,
+    });
+    op_def.inputs.push(NodeIO {
+        tensor_name: "filter".into(),
+        data_type: DataType::F32,
+    });
+    op_def.outputs.push(NodeIO {
+        tensor_name: "output".into(),
+        data_type: DataType::F32,
+    });
+
+    // Input: 1x1x4x4, all ones
+    // Filter: 1x1x3x3, all ones
+    // Output: 1x1x2x2 with stride=1, pad=0
+    // Convolution of all-ones with all-ones 3x3 filter = 9.0 at each position
+    let input = Tensor::from_data(
+        "input".into(),
+        vec![1, 1, 4, 4],
+        DataType::F32,
+        vec![1.0f32; 16],
+    );
+    let filter = Tensor::from_data(
+        "filter".into(),
+        vec![1, 1, 3, 3],
+        DataType::F32,
+        vec![1.0f32; 9],
+    );
+    let mut output = Tensor::new("output".into(), vec![1, 1, 2, 2], DataType::F32);
+
+    let compiled = backend
+        .compile_operator(&op_def, &[&input, &filter], &[&output])
+        .unwrap();
+
+    let result = backend.execute(&compiled, &[&input, &filter], &mut [&mut output]);
+    assert!(result.is_ok());
+
+    // Each output element should be sum of 9 input elements = 9.0
+    let bytes = output.data_as_bytes();
+    let output_data: Vec<f32> = bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+
+    // Output shape should be 1x1x2x2
+    assert_eq!(output.shape, vec![1, 1, 2, 2]);
+
+    // Each output value should be 9.0 (3x3 filter of all ones)
+    let tolerance = 0.001;
+    for val in &output_data {
+        assert!((*val - 9.0).abs() < tolerance, "Expected 9.0, got {}", val);
+    }
+}
