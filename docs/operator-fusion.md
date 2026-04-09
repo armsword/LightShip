@@ -12,6 +12,7 @@
 | Conv+ReLU6 | Conv → ReLU6 | 卷积后接ReLU6激活 |
 | Add+ReLU | Add → ReLU | 残差连接中的ReLU |
 | Conv+BatchNorm | Conv → BN | 卷积后接批归一化（已实现） |
+| BatchNorm+ReLU | BN → ReLU | 批归一化后接ReLU（已实现） |
 | Conv+Sigmoid | Conv → Sigmoid | 卷积后接Sigmoid（待实现） |
 
 ## 3. 融合条件
