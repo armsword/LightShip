@@ -240,6 +240,7 @@ impl ShapeInference {
         input_shapes: &HashMap<String, Vec<usize>>,
     ) -> Option<Vec<Vec<usize>>> {
         match node.operator_type {
+            // === Convolution ===
             OperatorType::Conv2d => {
                 let input_name = node.inputs.first()?.tensor_name.as_str();
                 let input_shape = input_shapes.get(input_name)?;
@@ -266,33 +267,212 @@ impl ShapeInference {
                 }
                 None
             }
-            OperatorType::ReLU | OperatorType::Sigmoid | OperatorType::Tanh => {
-                // Activation doesn't change shape
-                let input_name = node.inputs.first()?.tensor_name.as_str();
-                input_shapes.get(input_name).map(|s| vec![s.clone()])
-            }
-            OperatorType::Reshape => {
-                // Reshape preserves element count
-                let input_name = node.inputs.first()?.tensor_name.as_str();
-                input_shapes.get(input_name).map(|s| vec![s.clone()])
-            }
-            OperatorType::MaxPool2d | OperatorType::AvgPool2d => {
-                // Pooling reduces spatial dimensions - assume 2x2 kernel
+            OperatorType::ConvTranspose2d => {
+                // ConvTranspose increases spatial dimensions
                 let input_name = node.inputs.first()?.tensor_name.as_str();
                 let input_shape = input_shapes.get(input_name)?;
 
                 if input_shape.len() >= 4 {
                     let n = input_shape[0];
                     let c = input_shape[1];
-                    let h = input_shape[2] / 2;
+                    let h = input_shape[2] * 2;  // stride=2 by default
+                    let w = input_shape[3] * 2;
+
+                    return Some(vec![vec![n, c, h, w]]);
+                }
+                None
+            }
+
+            // === Activation functions (preserve shape) ===
+            OperatorType::ReLU | OperatorType::ReLU6 | OperatorType::Sigmoid | OperatorType::Tanh | OperatorType::GELU | OperatorType::SiLU => {
+                let input_name = node.inputs.first()?.tensor_name.as_str();
+                input_shapes.get(input_name).map(|s| vec![s.clone()])
+            }
+
+            // === Normalization (preserve shape) ===
+            OperatorType::BatchNorm | OperatorType::LayerNorm | OperatorType::InstanceNorm => {
+                let input_name = node.inputs.first()?.tensor_name.as_str();
+                input_shapes.get(input_name).map(|s| vec![s.clone()])
+            }
+
+            // === Softmax (preserves shape, typically on last dim) ===
+            OperatorType::Softmax => {
+                let input_name = node.inputs.first()?.tensor_name.as_str();
+                input_shapes.get(input_name).map(|s| vec![s.clone()])
+            }
+
+            // === Element-wise binary operations (broadcast) ===
+            OperatorType::Add | OperatorType::Sub | OperatorType::Mul | OperatorType::Div => {
+                // For simplicity, assume shapes match or broadcast to larger
+                let input_name = node.inputs.first()?.tensor_name.as_str();
+                input_shapes.get(input_name).map(|s| vec![s.clone()])
+            }
+
+            // === Matrix multiplication ===
+            OperatorType::MatMul | OperatorType::FullyConnected => {
+                // [M, K] @ [K, N] = [M, N]
+                // For FC: input [batch, in_features] -> output [batch, out_features]
+                let input_name = node.inputs.first()?.tensor_name.as_str();
+                let input_shape = input_shapes.get(input_name)?;
+
+                if input_shape.len() >= 2 {
+                    let mut output_shape = input_shape[..input_shape.len() - 1].to_vec();
+                    output_shape.push(512); // Default output features
+                    return Some(vec![output_shape]);
+                }
+                input_shapes.get(input_name).map(|s| vec![s.clone()])
+            }
+
+            // === Pooling ===
+            OperatorType::MaxPool2d | OperatorType::AvgPool2d => {
+                let input_name = node.inputs.first()?.tensor_name.as_str();
+                let input_shape = input_shapes.get(input_name)?;
+
+                if input_shape.len() >= 4 {
+                    let n = input_shape[0];
+                    let c = input_shape[1];
+                    let h = input_shape[2] / 2;  // 2x2 kernel, stride 2
                     let w = input_shape[3] / 2;
 
                     return Some(vec![vec![n, c, h, w]]);
                 }
                 None
             }
-            _ => None,
+            OperatorType::GlobalAvgPool2d | OperatorType::GlobalMaxPool2d => {
+                // Global pooling reduces H,W to 1
+                let input_name = node.inputs.first()?.tensor_name.as_str();
+                let input_shape = input_shapes.get(input_name)?;
+
+                if input_shape.len() >= 4 {
+                    let n = input_shape[0];
+                    let c = input_shape[1];
+
+                    return Some(vec![vec![n, c, 1, 1]]);
+                }
+                None
+            }
+
+            // === Reshape operations ===
+            OperatorType::Reshape => {
+                // Reshape preserves element count
+                let input_name = node.inputs.first()?.tensor_name.as_str();
+                input_shapes.get(input_name).map(|s| vec![s.clone()])
+            }
+            OperatorType::Flatten => {
+                // Flatten reshapes to [batch, features]
+                let input_name = node.inputs.first()?.tensor_name.as_str();
+                let input_shape = input_shapes.get(input_name)?;
+
+                if input_shape.len() >= 2 {
+                    let batch = input_shape[0];
+                    let features: usize = input_shape[1..].iter().product();
+                    return Some(vec![vec![batch, features]]);
+                }
+                None
+            }
+            OperatorType::Squeeze | OperatorType::Unsqueeze => {
+                // Squeeze/Unsqueeze remove or add dimension of size 1
+                let input_name = node.inputs.first()?.tensor_name.as_str();
+                input_shapes.get(input_name).map(|s| vec![s.clone()])
+            }
+
+            // === Transpose ===
+            OperatorType::Transpose => {
+                let input_name = node.inputs.first()?.tensor_name.as_str();
+                let input_shape = input_shapes.get(input_name)?;
+
+                if input_shape.len() == 4 {
+                    // [N, C, H, W] -> [N, H, W, C] (NHWC) or similar permutation
+                    return Some(vec![vec![input_shape[0], input_shape[2], input_shape[3], input_shape[1]]]);
+                }
+                input_shapes.get(input_name).map(|s| vec![s.clone()])
+            }
+
+            // === Concat ===
+            OperatorType::Concat => {
+                // Concatenation along an axis preserves all other dimensions
+                // For simplicity, return first input's shape
+                // (actual concat would need axis from attributes)
+                let input_name = node.inputs.first()?.tensor_name.as_str();
+                input_shapes.get(input_name).map(|s| vec![s.clone()])
+            }
+
+            // === Split ===
+            OperatorType::Split => {
+                // Split produces multiple outputs with same shape as input on split axis
+                let input_name = node.inputs.first()?.tensor_name.as_str();
+                let input_shape = input_shapes.get(input_name)?;
+
+                // Return same shape (actual split would produce chunks)
+                Some(vec![input_shape.clone()])
+            }
+
+            // === Slice ===
+            OperatorType::Slice => {
+                let input_name = node.inputs.first()?.tensor_name.as_str();
+                input_shapes.get(input_name).map(|s| vec![s.clone()])
+            }
+
+            // === Pad ===
+            OperatorType::Pad => {
+                let input_name = node.inputs.first()?.tensor_name.as_str();
+                input_shapes.get(input_name).map(|s| vec![s.clone()])
+            }
+
+            // === Attention ===
+            OperatorType::SelfAttention | OperatorType::MultiHeadAttention => {
+                // Attention: [batch, seq_len, features] -> [batch, seq_len, features]
+                let input_name = node.inputs.first()?.tensor_name.as_str();
+                input_shapes.get(input_name).map(|s| vec![s.clone()])
+            }
+
+            // === Unknown/Identity ===
+            _ => {
+                // Default: preserve input shape
+                let input_name = node.inputs.first()?.tensor_name.as_str();
+                input_shapes.get(input_name).map(|s| vec![s.clone()])
+            }
         }
+    }
+
+    /// Infer shapes for the entire graph
+    ///
+    /// Given input shapes for graph inputs, propagates shapes through all nodes.
+    /// Returns a map from tensor name to inferred shape, or None if inference fails.
+    pub fn infer_graph_shapes(
+        &self,
+        graph: &Graph,
+        input_shapes: &HashMap<String, Vec<usize>>,
+    ) -> Option<HashMap<String, Vec<usize>>> {
+        let mut shapes = input_shapes.clone();
+
+        // Topologically sort nodes
+        let sorted = graph.topological_sort();
+
+        // Process each node in order
+        for node_id in sorted {
+            let node = graph.nodes.iter().find(|n| n.id == node_id)?;
+
+            // Collect input shapes for this node
+            let node_input_shapes: HashMap<String, Vec<usize>> = node
+                .inputs
+                .iter()
+                .filter_map(|input| {
+                    shapes.get(&input.tensor_name).map(|s| (input.tensor_name.clone(), s.clone()))
+                })
+                .collect();
+
+            // Infer output shapes
+            if let Some(output_shapes) = self.infer_shape(node, &node_input_shapes) {
+                for (i, output) in node.outputs.iter().enumerate() {
+                    if i < output_shapes.len() {
+                        shapes.insert(output.tensor_name.clone(), output_shapes[i].clone());
+                    }
+                }
+            }
+        }
+
+        Some(shapes)
     }
 }
 
@@ -1068,5 +1248,211 @@ mod tests {
         assert!(output_node.is_some());
         let output = output_node.unwrap();
         assert_eq!(output.inputs[0].tensor_name, "mul_output");
+    }
+}
+
+#[cfg(test)]
+mod shape_inference_tests {
+    use super::*;
+    use crate::common::DataType;
+    use std::collections::HashMap;
+
+    fn make_node_io(name: &str) -> NodeIO {
+        NodeIO {
+            tensor_name: name.to_string(),
+            data_type: DataType::F32,
+        }
+    }
+
+    #[test]
+    fn test_shape_inference_relu_preserves_shape() {
+        let si = ShapeInference::new();
+        let mut node = Node::new(0, "relu".to_string(), OperatorType::ReLU);
+        node.inputs.push(make_node_io("input"));
+        node.outputs.push(make_node_io("output"));
+
+        let mut input_shapes = HashMap::new();
+        input_shapes.insert("input".to_string(), vec![1, 64, 32, 32]);
+
+        let result = si.infer_shape(&node, &input_shapes);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap()[0], vec![1, 64, 32, 32]);
+    }
+
+    #[test]
+    fn test_shape_inference_conv2d() {
+        let si = ShapeInference::new();
+        let mut node = Node::new(0, "conv".to_string(), OperatorType::Conv2d);
+        node.inputs.push(make_node_io("input"));
+        node.outputs.push(make_node_io("output"));
+
+        let mut input_shapes = HashMap::new();
+        input_shapes.insert("input".to_string(), vec![1, 3, 32, 32]);  // NCHW
+
+        let result = si.infer_shape(&node, &input_shapes);
+        assert!(result.is_some());
+        // Default: 3x3 kernel, stride 1, pad 0
+        // out_h = (32 + 0 - 3) / 1 + 1 = 30
+        // out_w = (32 + 0 - 3) / 1 + 1 = 30
+        assert_eq!(result.unwrap()[0], vec![1, 3, 30, 30]);
+    }
+
+    #[test]
+    fn test_shape_inference_batchnorm() {
+        let si = ShapeInference::new();
+        let mut node = Node::new(0, "bn".to_string(), OperatorType::BatchNorm);
+        node.inputs.push(make_node_io("input"));
+        node.outputs.push(make_node_io("output"));
+
+        let mut input_shapes = HashMap::new();
+        input_shapes.insert("input".to_string(), vec![1, 64, 16, 16]);
+
+        let result = si.infer_shape(&node, &input_shapes);
+        assert!(result.is_some());
+        // BatchNorm preserves shape
+        assert_eq!(result.unwrap()[0], vec![1, 64, 16, 16]);
+    }
+
+    #[test]
+    fn test_shape_inference_matmul() {
+        let si = ShapeInference::new();
+        let mut node = Node::new(0, "matmul".to_string(), OperatorType::MatMul);
+        node.inputs.push(make_node_io("input"));
+        node.outputs.push(make_node_io("output"));
+
+        let mut input_shapes = HashMap::new();
+        input_shapes.insert("input".to_string(), vec![32, 128]);  // [batch, features]
+
+        let result = si.infer_shape(&node, &input_shapes);
+        assert!(result.is_some());
+        // Output: [batch, 512] (default out_features)
+        assert_eq!(result.unwrap()[0], vec![32, 512]);
+    }
+
+    #[test]
+    fn test_shape_inference_maxpool() {
+        let si = ShapeInference::new();
+        let mut node = Node::new(0, "pool".to_string(), OperatorType::MaxPool2d);
+        node.inputs.push(make_node_io("input"));
+        node.outputs.push(make_node_io("output"));
+
+        let mut input_shapes = HashMap::new();
+        input_shapes.insert("input".to_string(), vec![1, 64, 32, 32]);
+
+        let result = si.infer_shape(&node, &input_shapes);
+        assert!(result.is_some());
+        // 2x2 pool with stride 2: 32 -> 16
+        assert_eq!(result.unwrap()[0], vec![1, 64, 16, 16]);
+    }
+
+    #[test]
+    fn test_shape_inference_global_avg_pool() {
+        let si = ShapeInference::new();
+        let mut node = Node::new(0, "gap".to_string(), OperatorType::GlobalAvgPool2d);
+        node.inputs.push(make_node_io("input"));
+        node.outputs.push(make_node_io("output"));
+
+        let mut input_shapes = HashMap::new();
+        input_shapes.insert("input".to_string(), vec![1, 64, 8, 8]);
+
+        let result = si.infer_shape(&node, &input_shapes);
+        assert!(result.is_some());
+        // Global pool reduces H,W to 1
+        assert_eq!(result.unwrap()[0], vec![1, 64, 1, 1]);
+    }
+
+    #[test]
+    fn test_shape_inference_flatten() {
+        let si = ShapeInference::new();
+        let mut node = Node::new(0, "flatten".to_string(), OperatorType::Flatten);
+        node.inputs.push(make_node_io("input"));
+        node.outputs.push(make_node_io("output"));
+
+        let mut input_shapes = HashMap::new();
+        input_shapes.insert("input".to_string(), vec![4, 8, 16, 16]);  // [batch, C, H, W]
+
+        let result = si.infer_shape(&node, &input_shapes);
+        assert!(result.is_some());
+        // Flatten: [4, 8*16*16] = [4, 2048]
+        assert_eq!(result.unwrap()[0], vec![4, 2048]);
+    }
+
+    #[test]
+    fn test_shape_inference_transpose() {
+        let si = ShapeInference::new();
+        let mut node = Node::new(0, "transpose".to_string(), OperatorType::Transpose);
+        node.inputs.push(make_node_io("input"));
+        node.outputs.push(make_node_io("output"));
+
+        let mut input_shapes = HashMap::new();
+        input_shapes.insert("input".to_string(), vec![1, 3, 32, 32]);  // NCHW
+
+        let result = si.infer_shape(&node, &input_shapes);
+        assert!(result.is_some());
+        // Transpose: NCHW -> NHWC = [1, 32, 32, 3]
+        assert_eq!(result.unwrap()[0], vec![1, 32, 32, 3]);
+    }
+
+    #[test]
+    fn test_shape_inference_softmax() {
+        let si = ShapeInference::new();
+        let mut node = Node::new(0, "softmax".to_string(), OperatorType::Softmax);
+        node.inputs.push(make_node_io("input"));
+        node.outputs.push(make_node_io("output"));
+
+        let mut input_shapes = HashMap::new();
+        input_shapes.insert("input".to_string(), vec![1, 10]);  // [batch, classes]
+
+        let result = si.infer_shape(&node, &input_shapes);
+        assert!(result.is_some());
+        // Softmax preserves shape
+        assert_eq!(result.unwrap()[0], vec![1, 10]);
+    }
+
+    #[test]
+    fn test_shape_inference_unknown_operator() {
+        let si = ShapeInference::new();
+        let mut node = Node::new(0, "custom".to_string(), OperatorType::Custom);
+        node.inputs.push(make_node_io("input"));
+        node.outputs.push(make_node_io("output"));
+
+        let mut input_shapes = HashMap::new();
+        input_shapes.insert("input".to_string(), vec![1, 64, 16, 16]);
+
+        // Unknown operators should preserve input shape
+        let result = si.infer_shape(&node, &input_shapes);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap()[0], vec![1, 64, 16, 16]);
+    }
+
+    #[test]
+    fn test_shape_inference_gelu() {
+        let si = ShapeInference::new();
+        let mut node = Node::new(0, "gelu".to_string(), OperatorType::GELU);
+        node.inputs.push(make_node_io("input"));
+        node.outputs.push(make_node_io("output"));
+
+        let mut input_shapes = HashMap::new();
+        input_shapes.insert("input".to_string(), vec![1, 512]);
+
+        let result = si.infer_shape(&node, &input_shapes);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap()[0], vec![1, 512]);
+    }
+
+    #[test]
+    fn test_shape_inference_add() {
+        let si = ShapeInference::new();
+        let mut node = Node::new(0, "add".to_string(), OperatorType::Add);
+        node.inputs.push(make_node_io("input1"));
+        node.inputs.push(make_node_io("input2"));
+        node.outputs.push(make_node_io("output"));
+
+        let mut input_shapes = HashMap::new();
+        input_shapes.insert("input1".to_string(), vec![1, 64, 32, 32]);
+
+        let result = si.infer_shape(&node, &input_shapes);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap()[0], vec![1, 64, 32, 32]);
     }
 }
