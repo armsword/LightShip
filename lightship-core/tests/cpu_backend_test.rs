@@ -808,3 +808,52 @@ fn test_cpu_backend_execute_conv2d() {
         assert!((*val - 9.0).abs() < tolerance, "Expected 9.0, got {}", val);
     }
 }
+
+#[test]
+fn test_cpu_backend_execute_batchnorm() {
+    let backend = CpuBackend::new();
+
+    let mut op_def = OperatorDef::new("batchnorm".into(), OperatorType::BatchNorm);
+    op_def.inputs.push(NodeIO {
+        tensor_name: "input".into(),
+        data_type: DataType::F32,
+    });
+    op_def.outputs.push(NodeIO {
+        tensor_name: "output".into(),
+        data_type: DataType::F32,
+    });
+
+    // Input: 1x2x2x2 (N=1, C=2, H=2, W=2)
+    // All values = 4.0
+    // BatchNorm with default gamma=1, beta=0, running_mean=0, running_var=1
+    // Should output (4 - 0) / sqrt(1 + eps) * 1 + 0 = 4.0
+    let input = Tensor::from_data(
+        "input".into(),
+        vec![1, 2, 2, 2],
+        DataType::F32,
+        vec![4.0f32; 8],
+    );
+    let mut output = Tensor::new("output".into(), vec![1, 2, 2, 2], DataType::F32);
+
+    let compiled = backend
+        .compile_operator(&op_def, &[&input], &[&output])
+        .unwrap();
+
+    let result = backend.execute(&compiled, &[&input], &mut [&mut output]);
+    assert!(result.is_ok());
+
+    // Verify output shape
+    assert_eq!(output.shape, vec![1, 2, 2, 2]);
+
+    // Output values should be same as input (gamma=1, beta=0, var=1)
+    let bytes = output.data_as_bytes();
+    let output_data: Vec<f32> = bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+
+    let tolerance = 0.001;
+    for val in &output_data {
+        assert!((*val - 4.0).abs() < tolerance, "Expected 4.0, got {}", val);
+    }
+}

@@ -5,7 +5,7 @@ use crate::backend::{
     Backend, BackendCapabilities, BackendSpecificData, CompiledOperator, CpuBackendConfig,
     MemoryBlock, SimdFlags,
 };
-use crate::operator::{Conv2d, Conv2dConfig};
+use crate::operator::{BatchNorm, Conv2d, Conv2dConfig};
 use crate::backend::memory::StorageLocation;
 use crate::common::{BackendType, DataType, LightShipError, Result, StorageLayout};
 use crate::common::error::BackendError;
@@ -162,6 +162,7 @@ impl Backend for CpuBackend {
             OperatorType::Reshape => self.execute_reshape(inputs, outputs),
             OperatorType::Transpose => self.execute_transpose(inputs, outputs),
             OperatorType::Conv2d => self.execute_conv2d(inputs, outputs),
+            OperatorType::BatchNorm => self.execute_batchnorm(inputs, outputs),
             _ => {
                 tracing::debug!(
                     "CPU backend: operator {:?} execution not yet implemented",
@@ -861,6 +862,38 @@ impl CpuBackend {
         output.data = result.data;
 
         tracing::debug!("CPU Conv2d: input shape={:?}, filter shape={:?}", input.shape, filter.shape);
+        Ok(())
+    }
+
+    fn execute_batchnorm(&self, inputs: &[&Tensor], outputs: &mut [&mut Tensor]) -> Result<()> {
+        if inputs.is_empty() || outputs.is_empty() {
+            return Err(LightShipError::InvalidParam("Missing input or output".into()));
+        }
+
+        let input = inputs[0];
+        let output = &mut outputs[0];
+
+        if input.data_type != DataType::F32 {
+            return Err(LightShipError::Backend(
+                BackendError::UnsupportedDataType(format!("{:?}", input.data_type)),
+            ));
+        }
+
+        // Determine number of channels from shape
+        let num_features = if input.shape.len() >= 2 {
+            input.shape[1]
+        } else {
+            return Err(LightShipError::InvalidParam("BatchNorm requires at least 2D input".into()));
+        };
+
+        // Create BatchNorm with default parameters (gamma=1, beta=0)
+        let bn = BatchNorm::new(num_features);
+        let result = bn.forward_inference(input)?;
+
+        // Copy output data
+        output.data = result.data;
+
+        tracing::debug!("CPU BatchNorm: input shape={:?}, channels={}", input.shape, num_features);
         Ok(())
     }
 }
