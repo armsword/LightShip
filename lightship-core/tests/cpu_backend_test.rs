@@ -489,3 +489,108 @@ fn test_cpu_backend_execute_softmax() {
     assert!((output_data[1] - 0.245).abs() < tolerance);
     assert!((output_data[2] - 0.665).abs() < tolerance);
 }
+
+#[test]
+fn test_cpu_backend_execute_div() {
+    let backend = CpuBackend::new();
+
+    let mut op_def = OperatorDef::new("div".into(), OperatorType::Div);
+    op_def.inputs.push(NodeIO {
+        tensor_name: "a".into(),
+        data_type: DataType::F32,
+    });
+    op_def.inputs.push(NodeIO {
+        tensor_name: "b".into(),
+        data_type: DataType::F32,
+    });
+    op_def.outputs.push(NodeIO {
+        tensor_name: "c".into(),
+        data_type: DataType::F32,
+    });
+
+    // Input a: [6.0, 8.0, 10.0]
+    // Input b: [2.0, 4.0, 5.0]
+    // Output: [3.0, 2.0, 2.0]
+    let input_a = Tensor::from_data(
+        "a".into(),
+        vec![3],
+        DataType::F32,
+        vec![6.0f32, 8.0, 10.0],
+    );
+    let input_b = Tensor::from_data(
+        "b".into(),
+        vec![3],
+        DataType::F32,
+        vec![2.0f32, 4.0, 5.0],
+    );
+    let mut output = Tensor::new("c".into(), vec![3], DataType::F32);
+
+    let compiled = backend
+        .compile_operator(&op_def, &[&input_a], &[&output])
+        .unwrap();
+
+    let result = backend.execute(&compiled, &[&input_a, &input_b], &mut [&mut output]);
+    assert!(result.is_ok());
+
+    let bytes = output.data_as_bytes();
+    let output_data: Vec<f32> = bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+
+    let tolerance = 0.001;
+    assert!((output_data[0] - 3.0).abs() < tolerance);
+    assert!((output_data[1] - 2.0).abs() < tolerance);
+    assert!((output_data[2] - 2.0).abs() < tolerance);
+}
+
+#[test]
+fn test_cpu_backend_execute_sub() {
+    let backend = CpuBackend::new();
+
+    let mut op_def = OperatorDef::new("sub".into(), OperatorType::Sub);
+    op_def.inputs.push(NodeIO {
+        tensor_name: "a".into(),
+        data_type: DataType::F32,
+    });
+    op_def.inputs.push(NodeIO {
+        tensor_name: "b".into(),
+        data_type: DataType::F32,
+    });
+    op_def.outputs.push(NodeIO {
+        tensor_name: "c".into(),
+        data_type: DataType::F32,
+    });
+
+    // Input a: [5.0, 10.0, 15.0]
+    // Input b: [2.0, 3.0, 4.0]
+    // Output: [3.0, 7.0, 11.0]
+    let input_a = Tensor::from_data(
+        "a".into(),
+        vec![3],
+        DataType::F32,
+        vec![5.0f32, 10.0, 15.0],
+    );
+    let input_b = Tensor::from_data(
+        "b".into(),
+        vec![3],
+        DataType::F32,
+        vec![2.0f32, 3.0, 4.0],
+    );
+    let mut output = Tensor::new("c".into(), vec![3], DataType::F32);
+
+    let compiled = backend
+        .compile_operator(&op_def, &[&input_a], &[&output])
+        .unwrap();
+
+    let result = backend.execute(&compiled, &[&input_a, &input_b], &mut [&mut output]);
+    assert!(result.is_ok());
+
+    let bytes = output.data_as_bytes();
+    let output_data: Vec<f32> = bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+
+    assert_eq!(output_data, &[3.0, 7.0, 11.0]);
+}
