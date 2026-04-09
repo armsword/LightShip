@@ -10,6 +10,7 @@ use crate::backend::memory::StorageLocation;
 use crate::common::{BackendType, DataType, LightShipError, Result, StorageLayout};
 use crate::common::error::BackendError;
 use crate::ir::{OperatorDef, OperatorType, Tensor};
+use crate::platform::{detect_simd_level, relu_simd, relu6_simd, SimdLevel};
 use std::alloc::{alloc, dealloc, Layout};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -230,21 +231,30 @@ impl CpuBackend {
             ));
         }
 
-        // Get input data as bytes and compute ReLU
         let input_bytes = input.data_as_bytes();
         let num_elements = input_bytes.len() / 4;
 
-        // ReLU: max(x, 0)
+        // Convert bytes to f32 slices for SIMD processing
+        let input_f32: Vec<f32> = input_bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+
+        let mut output_f32 = vec![0.0f32; num_elements];
+
+        // Use SIMD acceleration if available
+        let simd_level = detect_simd_level();
+        relu_simd(&input_f32, &mut output_f32, simd_level);
+
+        // Convert back to bytes
         let mut output_bytes = Vec::with_capacity(input_bytes.len());
-        for chunk in input_bytes.chunks_exact(4) {
-            let value = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-            let result = if value > 0.0 { value } else { 0.0 };
-            output_bytes.extend_from_slice(&result.to_le_bytes());
+        for &val in &output_f32 {
+            output_bytes.extend_from_slice(&val.to_le_bytes());
         }
 
         output.data = crate::ir::TensorData::Owned(output_bytes);
 
-        tracing::debug!("CPU ReLU: input shape={:?}, elements={}", input.shape, num_elements);
+        tracing::debug!("CPU ReLU: input shape={:?}, elements={}, simd={:?}", input.shape, num_elements, simd_level);
         Ok(())
     }
 
@@ -396,18 +406,29 @@ impl CpuBackend {
         }
 
         let input_bytes = input.data_as_bytes();
+        let num_elements = input_bytes.len() / 4;
 
-        // ReLU6: min(max(x, 0), 6)
+        // Convert bytes to f32 slices for SIMD processing
+        let input_f32: Vec<f32> = input_bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+
+        let mut output_f32 = vec![0.0f32; num_elements];
+
+        // Use SIMD acceleration if available
+        let simd_level = detect_simd_level();
+        relu6_simd(&input_f32, &mut output_f32, simd_level);
+
+        // Convert back to bytes
         let mut output_bytes = Vec::with_capacity(input_bytes.len());
-        for chunk in input_bytes.chunks_exact(4) {
-            let value = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-            let result = value.max(0.0).min(6.0);
-            output_bytes.extend_from_slice(&result.to_le_bytes());
+        for &val in &output_f32 {
+            output_bytes.extend_from_slice(&val.to_le_bytes());
         }
 
         output.data = crate::ir::TensorData::Owned(output_bytes);
 
-        tracing::debug!("CPU ReLU6: executed {} elements", input_bytes.len() / 4);
+        tracing::debug!("CPU ReLU6: input shape={:?}, elements={}, simd={:?}", input.shape, num_elements, simd_level);
         Ok(())
     }
 
