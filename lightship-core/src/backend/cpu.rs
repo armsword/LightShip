@@ -148,6 +148,7 @@ impl Backend for CpuBackend {
         match op.operator_type {
             OperatorType::ReLU => self.execute_relu(inputs, outputs),
             OperatorType::Add => self.execute_add(inputs, outputs),
+            OperatorType::Mul => self.execute_mul(inputs, outputs),
             _ => {
                 tracing::debug!(
                     "CPU backend: operator {:?} execution not yet implemented",
@@ -265,6 +266,42 @@ impl CpuBackend {
         output.data = crate::ir::TensorData::Owned(output_bytes);
 
         tracing::debug!("CPU Add: executed {} elements", input_bytes_a.len() / 4);
+        Ok(())
+    }
+
+    fn execute_mul(&self, inputs: &[&Tensor], outputs: &mut [&mut Tensor]) -> Result<()> {
+        if inputs.len() < 2 || outputs.is_empty() {
+            return Err(LightShipError::InvalidParam("Mul requires 2 inputs and 1 output".into()));
+        }
+
+        let input_a = inputs[0];
+        let input_b = inputs[1];
+        let output = &mut outputs[0];
+
+        if input_a.data_type != DataType::F32 || input_b.data_type != DataType::F32 {
+            return Err(LightShipError::Backend(
+                BackendError::UnsupportedDataType("Mul requires F32 inputs".into()),
+            ));
+        }
+
+        let input_bytes_a = input_a.data_as_bytes();
+        let input_bytes_b = input_b.data_as_bytes();
+
+        if input_bytes_a.len() != input_bytes_b.len() {
+            return Err(LightShipError::InvalidParam("Mul inputs must have same size".into()));
+        }
+
+        // Element-wise multiplication: a * b
+        let mut output_bytes = Vec::with_capacity(input_bytes_a.len());
+        for (chunk_a, chunk_b) in input_bytes_a.chunks_exact(4).zip(input_bytes_b.chunks_exact(4)) {
+            let a = f32::from_le_bytes([chunk_a[0], chunk_a[1], chunk_a[2], chunk_a[3]]);
+            let b = f32::from_le_bytes([chunk_b[0], chunk_b[1], chunk_b[2], chunk_b[3]]);
+            output_bytes.extend_from_slice(&(a * b).to_le_bytes());
+        }
+
+        output.data = crate::ir::TensorData::Owned(output_bytes);
+
+        tracing::debug!("CPU Mul: executed {} elements", input_bytes_a.len() / 4);
         Ok(())
     }
 }

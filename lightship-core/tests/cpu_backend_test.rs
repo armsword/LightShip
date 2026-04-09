@@ -173,3 +173,52 @@ fn test_cpu_backend_synchronize() {
     let result = backend.synchronize();
     assert!(result.is_ok());
 }
+
+#[test]
+fn test_cpu_backend_execute_mul() {
+    let backend = CpuBackend::new();
+
+    let mut op_def = OperatorDef::new("mul".into(), OperatorType::Mul);
+    op_def.inputs.push(NodeIO {
+        tensor_name: "a".into(),
+        data_type: DataType::F32,
+    });
+    op_def.inputs.push(NodeIO {
+        tensor_name: "b".into(),
+        data_type: DataType::F32,
+    });
+    op_def.outputs.push(NodeIO {
+        tensor_name: "c".into(),
+        data_type: DataType::F32,
+    });
+
+    // Create input tensors with known values
+    let input_a = Tensor::from_data(
+        "a".into(),
+        vec![3],
+        DataType::F32,
+        vec![2.0f32, 3.0, 4.0],
+    );
+    let input_b = Tensor::from_data(
+        "b".into(),
+        vec![3],
+        DataType::F32,
+        vec![5.0f32, 6.0, 7.0],
+    );
+    let mut output = Tensor::new("c".into(), vec![3], DataType::F32);
+
+    let compiled = backend
+        .compile_operator(&op_def, &[&input_a, &input_b], &[&output])
+        .unwrap();
+
+    let result = backend.execute(&compiled, &[&input_a, &input_b], &mut [&mut output]);
+    assert!(result.is_ok());
+
+    // Verify Mul output: a * b = [10.0, 18.0, 28.0]
+    let bytes = output.data_as_bytes();
+    let output_data: Vec<f32> = bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    assert_eq!(output_data, &[10.0, 18.0, 28.0]);
+}
