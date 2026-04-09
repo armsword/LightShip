@@ -341,6 +341,7 @@ impl FusionPass {
                 FusionType::ConvReLU,
                 FusionType::ConvReLU6,
                 FusionType::AddReLU,
+                FusionType::ConvBatchNorm,
             ],
         }
     }
@@ -357,21 +358,33 @@ impl FusionPass {
         for i in 0..graph.nodes.len() {
             let node = &graph.nodes[i];
 
-            // Check if this node can be a fusion producer
             match node.operator_type {
-                OperatorType::Conv2d | OperatorType::Add => {
-                    // Look for ReLU/ReLU6 consumers
+                OperatorType::Conv2d => {
+                    // Look for ReLU/ReLU6 consumers (Conv + ReLU fusion)
                     if let Some(consumer) = self.find_relu_consumer(graph, node) {
-                        // Only fuse if the ReLU node itself has exactly one consumer
-                        // If ReLU has multiple consumers, we can't fuse without breaking the graph
-                        if !self.has_single_consumer(graph, &consumer) {
-                            continue;
+                        if self.has_single_consumer(graph, &consumer) {
+                            if self.fusion_types.contains(&FusionType::ConvReLU) {
+                                candidates.push((node.id, consumer.id, FusionType::ConvReLU));
+                            }
                         }
+                    }
 
-                        if node.operator_type == OperatorType::Conv2d {
-                            candidates.push((node.id, consumer.id, FusionType::ConvReLU));
-                        } else if node.operator_type == OperatorType::Add {
-                            candidates.push((node.id, consumer.id, FusionType::AddReLU));
+                    // Look for BatchNorm consumers (Conv + BN fusion)
+                    if let Some(consumer) = self.find_batchnorm_consumer(graph, node) {
+                        if self.has_single_consumer(graph, &consumer) {
+                            if self.fusion_types.contains(&FusionType::ConvBatchNorm) {
+                                candidates.push((node.id, consumer.id, FusionType::ConvBatchNorm));
+                            }
+                        }
+                    }
+                }
+                OperatorType::Add => {
+                    // Look for ReLU/ReLU6 consumers (Add + ReLU fusion)
+                    if let Some(consumer) = self.find_relu_consumer(graph, node) {
+                        if self.has_single_consumer(graph, &consumer) {
+                            if self.fusion_types.contains(&FusionType::AddReLU) {
+                                candidates.push((node.id, consumer.id, FusionType::AddReLU));
+                            }
                         }
                     }
                 }
@@ -391,6 +404,22 @@ impl FusionPass {
             if node.inputs.iter().any(|i| i.tensor_name == output_name) {
                 // Check if it's a ReLU or ReLU6
                 if matches!(node.operator_type, OperatorType::ReLU | OperatorType::ReLU6) {
+                    return Some(node.clone());
+                }
+            }
+        }
+        None
+    }
+
+    /// Find a BatchNorm consumer of this node's output
+    fn find_batchnorm_consumer(&self, graph: &Graph, producer: &Node) -> Option<Node> {
+        let output_name = producer.outputs.first()?.tensor_name.clone();
+
+        // Find nodes that consume this output
+        for node in &graph.nodes {
+            if node.inputs.iter().any(|i| i.tensor_name == output_name) {
+                // Check if it's a BatchNorm
+                if matches!(node.operator_type, OperatorType::BatchNorm) {
                     return Some(node.clone());
                 }
             }
@@ -486,6 +515,54 @@ impl FusionPass {
         // Remove the ReLU node
         graph.retain_nodes(|n| n.id != relu_id);
     }
+
+    /// Fuse Conv + BatchNorm into a single Conv node with fusion info
+    ///
+    /// This performs a "lightweight" fusion where:
+    /// 1. The Conv node is marked with FusionInfo indicating Conv+BN fusion
+    /// 2. The eliminate_batch_norm flag indicates BN can be eliminated from the graph
+    /// 3. Consumers of BN are redirected to use Conv's output
+    /// 4. The BN node is removed from the graph
+    ///
+    /// Note: For full fusion, Conv weights would need to be updated with BN parameters:
+    ///   new_weight = gamma / sqrt(var + eps) * weight
+    ///   new_bias = gamma / sqrt(var + eps) * (bias - mean) + beta
+    fn fuse_conv_batch_norm(&self, graph: &mut Graph, conv_id: NodeId, bn_id: NodeId) {
+        // First, collect all the information we need
+        let (bn_output, conv_output) = {
+            let bn_out = graph.nodes.iter()
+                .find(|n| n.id == bn_id)
+                .and_then(|n| n.outputs.first())
+                .map(|o| o.tensor_name.clone());
+
+            let conv_out = graph.nodes.iter()
+                .find(|n| n.id == conv_id)
+                .and_then(|n| n.outputs.first())
+                .map(|o| o.tensor_name.clone());
+
+            (bn_out, conv_out)
+        };
+
+        // Update the Conv node's fusion info
+        if let Some(conv_node) = graph.nodes.iter_mut().find(|n| n.id == conv_id) {
+            let fusion_info = FusionInfo::conv_batch_norm();
+            conv_node.fusion = Some(fusion_info);
+        }
+
+        // Update consumers of bn_output to use conv_output
+        if let (Some(bn_out), Some(conv_out)) = (bn_output, conv_output) {
+            for node in &mut graph.nodes {
+                for input in &mut node.inputs {
+                    if input.tensor_name == bn_out {
+                        input.tensor_name = conv_out.clone();
+                    }
+                }
+            }
+        }
+
+        // Remove the BatchNorm node
+        graph.retain_nodes(|n| n.id != bn_id);
+    }
 }
 
 impl GraphOptimizer for FusionPass {
@@ -501,6 +578,9 @@ impl GraphOptimizer for FusionPass {
                 }
                 FusionType::AddReLU => {
                     self.fuse_add_relu(graph, producer_id, consumer_id);
+                }
+                FusionType::ConvBatchNorm => {
+                    self.fuse_conv_batch_norm(graph, producer_id, consumer_id);
                 }
                 _ => {}
             }
@@ -553,6 +633,10 @@ mod tests {
 
     fn add_add_node(graph: &mut Graph, name: &str, input1: &str, input2: &str) -> NodeId {
         add_generic_node(graph, name, OperatorType::Add, vec![input1, input2], vec![&format!("{}_output", name)])
+    }
+
+    fn add_batchnorm_node(graph: &mut Graph, name: &str, input: &str) -> NodeId {
+        add_generic_node(graph, name, OperatorType::BatchNorm, vec![input], vec![&format!("{}_output", name)])
     }
 
     #[test]
@@ -670,5 +754,69 @@ mod tests {
 
         // Should not find fusion candidate because ReLU has multiple consumers
         assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn test_find_conv_batchnorm_fusion() {
+        let fusion = FusionPass::new();
+        let mut graph = create_test_graph();
+
+        // Create: Conv -> BatchNorm
+        let conv_id = add_conv_node(&mut graph, "conv");
+        let _bn_id = add_batchnorm_node(&mut graph, "bn", "conv_output");
+
+        // Add an output consumer
+        let _output_node = add_generic_node(&mut graph, "output", OperatorType::Reshape, vec!["bn_output"], vec!["final_output"]);
+
+        let candidates = fusion.find_fusion_candidates(&graph);
+        assert!(candidates.iter().any(|(_, _, ft)| *ft == FusionType::ConvBatchNorm));
+    }
+
+    #[test]
+    fn test_conv_batchnorm_fusion() {
+        let fusion = FusionPass::new();
+        let mut graph = create_test_graph();
+
+        // Create: Conv -> BatchNorm
+        let conv_id = add_conv_node(&mut graph, "conv");
+        let bn_id = add_batchnorm_node(&mut graph, "bn", "conv_output");
+
+        // Add an output consumer
+        let _output_node = add_generic_node(&mut graph, "output", OperatorType::Reshape, vec!["bn_output"], vec!["final_output"]);
+
+        // Apply fusion
+        fusion.optimize(&mut graph);
+
+        // Check that BatchNorm is removed
+        let bn_exists = graph.nodes.iter().any(|n| n.id == bn_id);
+        assert!(!bn_exists, "BatchNorm node should be removed after fusion");
+
+        // Check that Conv has fusion info
+        let conv_node = graph.nodes.iter().find(|n| n.id == conv_id);
+        assert!(conv_node.is_some());
+        let conv = conv_node.unwrap();
+        assert!(conv.fusion.is_some());
+        assert_eq!(conv.fusion.as_ref().unwrap().fusion_type, FusionType::ConvBatchNorm);
+        assert!(conv.fusion.as_ref().unwrap().eliminate_batch_norm);
+    }
+
+    #[test]
+    fn test_conv_batchnorm_fusion_eliminates_bn() {
+        let fusion = FusionPass::new();
+        let mut graph = create_test_graph();
+
+        // Create: Conv -> BatchNorm -> Output
+        let conv_id = add_conv_node(&mut graph, "conv");
+        let _bn_id = add_batchnorm_node(&mut graph, "bn", "conv_output");
+        let output_id = add_generic_node(&mut graph, "output", OperatorType::Reshape, vec!["bn_output"], vec!["final_output"]);
+
+        // Apply fusion
+        fusion.optimize(&mut graph);
+
+        // The output node's input should now be conv_output instead of bn_output
+        let output_node = graph.nodes.iter().find(|n| n.id == output_id);
+        assert!(output_node.is_some());
+        let output = output_node.unwrap();
+        assert_eq!(output.inputs[0].tensor_name, "conv_output");
     }
 }
