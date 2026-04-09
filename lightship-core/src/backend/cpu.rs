@@ -149,6 +149,7 @@ impl Backend for CpuBackend {
             OperatorType::ReLU => self.execute_relu(inputs, outputs),
             OperatorType::Add => self.execute_add(inputs, outputs),
             OperatorType::Mul => self.execute_mul(inputs, outputs),
+            OperatorType::Sigmoid => self.execute_sigmoid(inputs, outputs),
             _ => {
                 tracing::debug!(
                     "CPU backend: operator {:?} execution not yet implemented",
@@ -302,6 +303,36 @@ impl CpuBackend {
         output.data = crate::ir::TensorData::Owned(output_bytes);
 
         tracing::debug!("CPU Mul: executed {} elements", input_bytes_a.len() / 4);
+        Ok(())
+    }
+
+    fn execute_sigmoid(&self, inputs: &[&Tensor], outputs: &mut [&mut Tensor]) -> Result<()> {
+        if inputs.is_empty() || outputs.is_empty() {
+            return Err(LightShipError::InvalidParam("Missing input or output".into()));
+        }
+
+        let input = inputs[0];
+        let output = &mut outputs[0];
+
+        if input.data_type != DataType::F32 {
+            return Err(LightShipError::Backend(
+                BackendError::UnsupportedDataType(format!("{:?}", input.data_type)),
+            ));
+        }
+
+        let input_bytes = input.data_as_bytes();
+
+        // sigmoid(x) = 1 / (1 + exp(-x))
+        let mut output_bytes = Vec::with_capacity(input_bytes.len());
+        for chunk in input_bytes.chunks_exact(4) {
+            let x = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            let result = 1.0 / (1.0 + (-x).exp());
+            output_bytes.extend_from_slice(&result.to_le_bytes());
+        }
+
+        output.data = crate::ir::TensorData::Owned(output_bytes);
+
+        tracing::debug!("CPU Sigmoid: executed {} elements", input_bytes.len() / 4);
         Ok(())
     }
 }

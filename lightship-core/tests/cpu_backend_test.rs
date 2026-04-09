@@ -222,3 +222,49 @@ fn test_cpu_backend_execute_mul() {
         .collect();
     assert_eq!(output_data, &[10.0, 18.0, 28.0]);
 }
+
+#[test]
+fn test_cpu_backend_execute_sigmoid() {
+    let backend = CpuBackend::new();
+
+    let mut op_def = OperatorDef::new("sigmoid".into(), OperatorType::Sigmoid);
+    op_def.inputs.push(NodeIO {
+        tensor_name: "input".into(),
+        data_type: DataType::F32,
+    });
+    op_def.outputs.push(NodeIO {
+        tensor_name: "output".into(),
+        data_type: DataType::F32,
+    });
+
+    // Create input: [0.0, 1.0, -1.0]
+    // sigmoid(x) = 1 / (1 + exp(-x))
+    // sigmoid(0) = 0.5, sigmoid(1) ≈ 0.731, sigmoid(-1) ≈ 0.269
+    let input = Tensor::from_data(
+        "input".into(),
+        vec![3],
+        DataType::F32,
+        vec![0.0f32, 1.0, -1.0],
+    );
+    let mut output = Tensor::new("output".into(), vec![3], DataType::F32);
+
+    let compiled = backend
+        .compile_operator(&op_def, &[&input], &[&output])
+        .unwrap();
+
+    let result = backend.execute(&compiled, &[&input], &mut [&mut output]);
+    assert!(result.is_ok());
+
+    // Verify sigmoid output
+    let bytes = output.data_as_bytes();
+    let output_data: Vec<f32> = bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+
+    // Allow small floating point tolerance
+    let tolerance = 0.01;
+    assert!((output_data[0] - 0.5).abs() < tolerance);
+    assert!((output_data[1] - 0.73105858).abs() < tolerance);
+    assert!((output_data[2] - 0.26894142).abs() < tolerance);
+}
