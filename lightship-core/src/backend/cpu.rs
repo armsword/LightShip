@@ -5,7 +5,7 @@ use crate::backend::{
     Backend, BackendCapabilities, BackendSpecificData, CompiledOperator, CpuBackendConfig,
     MemoryBlock, SimdFlags,
 };
-use crate::operator::{BatchNorm, Conv2d, Conv2dConfig};
+use crate::operator::{BatchNorm, Conv2d, Conv2dConfig, Pool2d, Pool2dConfig};
 use crate::backend::memory::StorageLocation;
 use crate::common::{BackendType, DataType, LightShipError, Result, StorageLayout};
 use crate::common::error::BackendError;
@@ -516,55 +516,25 @@ impl CpuBackend {
             return Err(LightShipError::InvalidParam("MaxPool2d requires 4D NCHW input".into()));
         }
 
-        let [batch, channels, height, width] = &input.shape[..4] else {
-            return Err(LightShipError::InvalidParam("Invalid input shape".into()));
+        // Use Pool2d SIMD implementation
+        let config = Pool2dConfig {
+            kernel_h: 2,
+            kernel_w: 2,
+            stride_h: 2,
+            stride_w: 2,
+            pad_h: 0,
+            pad_w: 0,
+            dilation_h: 1,
+            dilation_w: 1,
+            count_include_pad: false,
         };
 
-        // Assume kernel=2, stride=2 for simplicity
-        let kernel = 2;
-        let stride = 2;
-        let out_h = (height + 2 * 0 - kernel) / stride + 1;
-        let out_w = (width + 2 * 0 - kernel) / stride + 1;
+        let pool = Pool2d::max_pool(config);
+        let result = pool.max_pool2d_simd(input)?;
 
-        let input_bytes = input.data_as_bytes();
+        output.data = result.data;
 
-        // For each output element, find max in kernel window
-        let mut output_bytes = Vec::with_capacity(batch * channels * out_h * out_w * 4);
-
-        for b in 0..*batch {
-            for c in 0..*channels {
-                for oh in 0..out_h {
-                    for ow in 0..out_w {
-                        let mut max_val = f32::NEG_INFINITY;
-
-                        for kh in 0..kernel {
-                            for kw in 0..kernel {
-                                let ih = oh * stride + kh;
-                                let iw = ow * stride + kw;
-
-                                if ih < *height && iw < *width {
-                                    let idx = ((b * channels + c) * height + ih) * width + iw;
-                                    let chunk_start = idx * 4;
-                                    let val = f32::from_le_bytes([
-                                        input_bytes[chunk_start],
-                                        input_bytes[chunk_start + 1],
-                                        input_bytes[chunk_start + 2],
-                                        input_bytes[chunk_start + 3],
-                                    ]);
-                                    max_val = max_val.max(val);
-                                }
-                            }
-                        }
-
-                        output_bytes.extend_from_slice(&max_val.to_le_bytes());
-                    }
-                }
-            }
-        }
-
-        output.data = crate::ir::TensorData::Owned(output_bytes);
-
-        tracing::debug!("CPU MaxPool2d: output shape=[{}, {}, {}, {}]", batch, channels, out_h, out_w);
+        tracing::debug!("CPU MaxPool2d: output shape={:?}", output.shape);
         Ok(())
     }
 
@@ -587,58 +557,25 @@ impl CpuBackend {
             return Err(LightShipError::InvalidParam("AvgPool2d requires 4D NCHW input".into()));
         }
 
-        let [batch, channels, height, width] = &input.shape[..4] else {
-            return Err(LightShipError::InvalidParam("Invalid input shape".into()));
+        // Use Pool2d implementation
+        let config = Pool2dConfig {
+            kernel_h: 2,
+            kernel_w: 2,
+            stride_h: 2,
+            stride_w: 2,
+            pad_h: 0,
+            pad_w: 0,
+            dilation_h: 1,
+            dilation_w: 1,
+            count_include_pad: false,
         };
 
-        // Assume kernel=2, stride=2 for simplicity
-        let kernel = 2;
-        let stride = 2;
-        let out_h = (height + 2 * 0 - kernel) / stride + 1;
-        let out_w = (width + 2 * 0 - kernel) / stride + 1;
+        let pool = Pool2d::avg_pool(config);
+        let result = pool.avg_pool2d(input)?;
 
-        let input_bytes = input.data_as_bytes();
+        output.data = result.data;
 
-        // For each output element, compute average in kernel window
-        let mut output_bytes = Vec::with_capacity(batch * channels * out_h * out_w * 4);
-
-        for b in 0..*batch {
-            for c in 0..*channels {
-                for oh in 0..out_h {
-                    for ow in 0..out_w {
-                        let mut sum = 0.0f32;
-                        let mut count = 0.0f32;
-
-                        for kh in 0..kernel {
-                            for kw in 0..kernel {
-                                let ih = oh * stride + kh;
-                                let iw = ow * stride + kw;
-
-                                if ih < *height && iw < *width {
-                                    let idx = ((b * channels + c) * height + ih) * width + iw;
-                                    let chunk_start = idx * 4;
-                                    let val = f32::from_le_bytes([
-                                        input_bytes[chunk_start],
-                                        input_bytes[chunk_start + 1],
-                                        input_bytes[chunk_start + 2],
-                                        input_bytes[chunk_start + 3],
-                                    ]);
-                                    sum += val;
-                                    count += 1.0;
-                                }
-                            }
-                        }
-
-                        let avg = if count > 0.0 { sum / count } else { 0.0 };
-                        output_bytes.extend_from_slice(&avg.to_le_bytes());
-                    }
-                }
-            }
-        }
-
-        output.data = crate::ir::TensorData::Owned(output_bytes);
-
-        tracing::debug!("CPU AvgPool2d: output shape=[{}, {}, {}, {}]", batch, channels, out_h, out_w);
+        tracing::debug!("CPU AvgPool2d: output shape={:?}", output.shape);
         Ok(())
     }
 
