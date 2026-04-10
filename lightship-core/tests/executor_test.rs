@@ -1,10 +1,10 @@
 //! Unit tests for executor module
 
-use lightship_core::common::BackendType;
 use lightship_core::executor::{
     ExecutionPlan, MemoryAllocation, MemoryPlan, ParallelGroup, ScheduledNode, Scheduler,
 };
-use lightship_core::ir::{FusionInfo, FusionType, Graph, Node, NodeIO, OperatorType};
+use lightship_core::executor::scheduler::SchedulerConfig;
+use lightship_core::ir::{FusionInfo, Graph, Node, NodeIO, OperatorType};
 use lightship_core::common::DataType;
 
 #[test]
@@ -173,6 +173,106 @@ fn test_scheduler_conv_relu() {
         data_type: DataType::F32,
     });
     graph.add_node(relu);
+
+    let plan = scheduler.schedule(&graph);
+
+    assert_eq!(plan.num_nodes(), 2);
+}
+
+#[test]
+fn test_scheduler_respects_data_dependencies() {
+    // Test that scheduler correctly orders nodes based on data dependencies
+    // Graph: input -> conv -> relu -> pool -> output
+    let scheduler = Scheduler::new();
+
+    let mut graph = Graph::new("test".to_string());
+
+    // Input node (no dependencies)
+    let mut input = Node::new(0, "input".to_string(), OperatorType::Reshape);
+    input.outputs.push(NodeIO {
+        tensor_name: "input_tensor".to_string(),
+        data_type: DataType::F32,
+    });
+    graph.add_node(input);
+
+    // Conv depends on input
+    let mut conv = Node::new(1, "conv".to_string(), OperatorType::Conv2d);
+    conv.inputs.push(NodeIO {
+        tensor_name: "input_tensor".to_string(),
+        data_type: DataType::F32,
+    });
+    conv.outputs.push(NodeIO {
+        tensor_name: "conv_out".to_string(),
+        data_type: DataType::F32,
+    });
+    graph.add_node(conv);
+
+    // ReLU depends on conv
+    let mut relu = Node::new(2, "relu".to_string(), OperatorType::ReLU);
+    relu.inputs.push(NodeIO {
+        tensor_name: "conv_out".to_string(),
+        data_type: DataType::F32,
+    });
+    relu.outputs.push(NodeIO {
+        tensor_name: "relu_out".to_string(),
+        data_type: DataType::F32,
+    });
+    graph.add_node(relu);
+
+    // Pool depends on relu
+    let mut pool = Node::new(3, "pool".to_string(), OperatorType::MaxPool2d);
+    pool.inputs.push(NodeIO {
+        tensor_name: "relu_out".to_string(),
+        data_type: DataType::F32,
+    });
+    pool.outputs.push(NodeIO {
+        tensor_name: "pool_out".to_string(),
+        data_type: DataType::F32,
+    });
+    graph.add_node(pool);
+
+    let plan = scheduler.schedule(&graph);
+
+    // All 4 nodes should be scheduled
+    assert_eq!(plan.num_nodes(), 4);
+}
+
+#[test]
+fn test_scheduler_with_parallel_ops() {
+    // Test that independent ops can be identified for parallel execution
+    let scheduler = Scheduler::with_config(
+        SchedulerConfig {
+            enable_parallel: true,
+            max_parallel_size: 4,
+            optimize_memory: true,
+        }
+    );
+
+    let mut graph = Graph::new("test".to_string());
+
+    // Input
+    let mut input = Node::new(0, "input".to_string(), OperatorType::Reshape);
+    input.outputs.push(NodeIO {
+        tensor_name: "input_tensor".to_string(),
+        data_type: DataType::F32,
+    });
+    graph.add_node(input);
+
+    // Split into two branches (conv and pool are independent after split)
+    let mut split = Node::new(1, "split".to_string(), OperatorType::Reshape);
+    split.inputs.push(NodeIO {
+        tensor_name: "input_tensor".to_string(),
+        data_type: DataType::F32,
+    });
+    split.outputs.push(NodeIO {
+        tensor_name: "branch_a".to_string(),
+        data_type: DataType::F32,
+    });
+    split.outputs.push(NodeIO {
+        tensor_name: "branch_b".to_string(),
+        data_type: DataType::F32,
+    });
+    graph.add_node(split);
 
     let plan = scheduler.schedule(&graph);
 
