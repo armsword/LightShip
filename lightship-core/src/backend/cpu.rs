@@ -10,7 +10,7 @@ use crate::backend::memory::StorageLocation;
 use crate::common::{BackendType, DataType, LightShipError, Result, StorageLayout};
 use crate::common::error::BackendError;
 use crate::ir::{OperatorDef, OperatorType, Tensor};
-use crate::platform::{add_simd, detect_simd_level, exp_simd, gemm_simd, mul_simd, relu_simd, relu6_simd, tanh_simd, SimdLevel};
+use crate::platform::{add_simd, detect_simd_level, div_simd, exp_simd, gemm_simd, mul_simd, relu_simd, relu6_simd, sub_simd, tanh_simd, SimdLevel};
 use std::alloc::{alloc, dealloc, Layout};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -712,16 +712,32 @@ impl CpuBackend {
         }
 
         // Element-wise division: a / b
+        let num_elements = input_bytes_a.len() / 4;
+
+        // Convert bytes to f32 slices
+        let a_f32: Vec<f32> = input_bytes_a
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let b_f32: Vec<f32> = input_bytes_b
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let mut c_f32 = vec![0.0f32; num_elements];
+
+        // Use SIMD acceleration
+        let simd_level = detect_simd_level();
+        div_simd(&a_f32, &b_f32, &mut c_f32, simd_level);
+
+        // Convert back to bytes
         let mut output_bytes = Vec::with_capacity(input_bytes_a.len());
-        for (chunk_a, chunk_b) in input_bytes_a.chunks_exact(4).zip(input_bytes_b.chunks_exact(4)) {
-            let a = f32::from_le_bytes([chunk_a[0], chunk_a[1], chunk_a[2], chunk_a[3]]);
-            let b = f32::from_le_bytes([chunk_b[0], chunk_b[1], chunk_b[2], chunk_b[3]]);
-            output_bytes.extend_from_slice(&(a / b).to_le_bytes());
+        for &val in &c_f32 {
+            output_bytes.extend_from_slice(&val.to_le_bytes());
         }
 
         output.data = crate::ir::TensorData::Owned(output_bytes);
 
-        tracing::debug!("CPU Div: executed {} elements", input_bytes_a.len() / 4);
+        tracing::debug!("CPU Div: executed {} elements, simd={:?}", num_elements, simd_level);
         Ok(())
     }
 
@@ -748,16 +764,32 @@ impl CpuBackend {
         }
 
         // Element-wise subtraction: a - b
+        let num_elements = input_bytes_a.len() / 4;
+
+        // Convert bytes to f32 slices
+        let a_f32: Vec<f32> = input_bytes_a
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let b_f32: Vec<f32> = input_bytes_b
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let mut c_f32 = vec![0.0f32; num_elements];
+
+        // Use SIMD acceleration
+        let simd_level = detect_simd_level();
+        sub_simd(&a_f32, &b_f32, &mut c_f32, simd_level);
+
+        // Convert back to bytes
         let mut output_bytes = Vec::with_capacity(input_bytes_a.len());
-        for (chunk_a, chunk_b) in input_bytes_a.chunks_exact(4).zip(input_bytes_b.chunks_exact(4)) {
-            let a = f32::from_le_bytes([chunk_a[0], chunk_a[1], chunk_a[2], chunk_a[3]]);
-            let b = f32::from_le_bytes([chunk_b[0], chunk_b[1], chunk_b[2], chunk_b[3]]);
-            output_bytes.extend_from_slice(&(a - b).to_le_bytes());
+        for &val in &c_f32 {
+            output_bytes.extend_from_slice(&val.to_le_bytes());
         }
 
         output.data = crate::ir::TensorData::Owned(output_bytes);
 
-        tracing::debug!("CPU Sub: executed {} elements", input_bytes_a.len() / 4);
+        tracing::debug!("CPU Sub: executed {} elements, simd={:?}", num_elements, simd_level);
         Ok(())
     }
 

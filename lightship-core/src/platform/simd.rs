@@ -194,6 +194,56 @@ pub fn mul_simd(a: &[f32], b: &[f32], c: &mut [f32], level: SimdLevel) {
     mul_scalar(a, b, c, len);
 }
 
+/// Element-wise subtraction: c[i] = a[i] - b[i]
+pub fn sub_simd(a: &[f32], b: &[f32], c: &mut [f32], level: SimdLevel) {
+    assert_eq!(a.len(), b.len());
+    assert_eq!(a.len(), c.len());
+    let len = a.len();
+    #[cfg(target_arch = "x86_64")]
+    {
+        match level {
+            SimdLevel::Avx512 => { unsafe { sub_avx512(a, b, c, len) }; return; }
+            SimdLevel::Avx2 => { unsafe { sub_avx2(a, b, c, len) }; return; }
+            SimdLevel::Avx => { unsafe { sub_avx(a, b, c, len) }; return; }
+            SimdLevel::Sse2 | SimdLevel::Neon => { unsafe { sub_sse(a, b, c, len) }; return; }
+            _ => {}
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if matches!(level, SimdLevel::Neon | SimdLevel::Neonfp16) {
+            unsafe { sub_neon(a, b, c, len) };
+            return;
+        }
+    }
+    sub_scalar(a, b, c, len);
+}
+
+/// Element-wise division: c[i] = a[i] / b[i]
+pub fn div_simd(a: &[f32], b: &[f32], c: &mut [f32], level: SimdLevel) {
+    assert_eq!(a.len(), b.len());
+    assert_eq!(a.len(), c.len());
+    let len = a.len();
+    #[cfg(target_arch = "x86_64")]
+    {
+        match level {
+            SimdLevel::Avx512 => { unsafe { div_avx512(a, b, c, len) }; return; }
+            SimdLevel::Avx2 => { unsafe { div_avx2(a, b, c, len) }; return; }
+            SimdLevel::Avx => { unsafe { div_avx(a, b, c, len) }; return; }
+            SimdLevel::Sse2 | SimdLevel::Neon => { unsafe { div_sse(a, b, c, len) }; return; }
+            _ => {}
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if matches!(level, SimdLevel::Neon | SimdLevel::Neonfp16) {
+            unsafe { div_neon(a, b, c, len) };
+            return;
+        }
+    }
+    div_scalar(a, b, c, len);
+}
+
 /// Compute exp(x) for each element (softmax use)
 pub fn exp_simd(input: &[f32], output: &mut [f32], level: SimdLevel) {
     let len = input.len().min(output.len());
@@ -379,6 +429,18 @@ fn add_scalar(a: &[f32], b: &[f32], c: &mut [f32], len: usize) {
 fn mul_scalar(a: &[f32], b: &[f32], c: &mut [f32], len: usize) {
     for i in 0..len {
         c[i] = a[i] * b[i];
+    }
+}
+
+fn div_scalar(a: &[f32], b: &[f32], c: &mut [f32], len: usize) {
+    for i in 0..len {
+        c[i] = a[i] / b[i];
+    }
+}
+
+fn sub_scalar(a: &[f32], b: &[f32], c: &mut [f32], len: usize) {
+    for i in 0..len {
+        c[i] = a[i] - b[i];
     }
 }
 
@@ -587,6 +649,23 @@ mod x86_64_impls {
         }
     }
 
+    #[target_feature(enable = "avx512f")]
+    pub(super) unsafe fn sub_avx512(a: &[f32], b: &[f32], c: &mut [f32], len: usize) {
+        use std::arch::x86_64::*;
+        let mut i = 0;
+        while i + 16 <= len {
+            let va = _mm512_loadu_ps(&a[i]);
+            let vb = _mm512_loadu_ps(&b[i]);
+            let vc = _mm512_sub_ps(va, vb);
+            _mm512_storeu_ps(&mut c[i], vc);
+            i += 16;
+        }
+        while i < len {
+            c[i] = a[i] - b[i];
+            i += 1;
+        }
+    }
+
     #[target_feature(enable = "avx2")]
     pub(super) unsafe fn add_avx2(a: &[f32], b: &[f32], c: &mut [f32], len: usize) {
         use std::arch::x86_64::*;
@@ -600,6 +679,23 @@ mod x86_64_impls {
         }
         while i < len {
             c[i] = a[i] + b[i];
+            i += 1;
+        }
+    }
+
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn sub_avx2(a: &[f32], b: &[f32], c: &mut [f32], len: usize) {
+        use std::arch::x86_64::*;
+        let mut i = 0;
+        while i + 8 <= len {
+            let va = _mm256_loadu_ps(&a[i]);
+            let vb = _mm256_loadu_ps(&b[i]);
+            let vc = _mm256_sub_ps(va, vb);
+            _mm256_storeu_ps(&mut c[i], vc);
+            i += 8;
+        }
+        while i < len {
+            c[i] = a[i] - b[i];
             i += 1;
         }
     }
@@ -621,6 +717,23 @@ mod x86_64_impls {
         }
     }
 
+    #[target_feature(enable = "avx")]
+    pub(super) unsafe fn sub_avx(a: &[f32], b: &[f32], c: &mut [f32], len: usize) {
+        use std::arch::x86_64::*;
+        let mut i = 0;
+        while i + 8 <= len {
+            let va = _mm256_loadu_ps(&a[i]);
+            let vb = _mm256_loadu_ps(&b[i]);
+            let vc = _mm256_sub_ps(va, vb);
+            _mm256_storeu_ps(&mut c[i], vc);
+            i += 8;
+        }
+        while i < len {
+            c[i] = a[i] - b[i];
+            i += 1;
+        }
+    }
+
     #[target_feature(enable = "sse2")]
     pub(super) unsafe fn add_sse(a: &[f32], b: &[f32], c: &mut [f32], len: usize) {
         use std::arch::x86_64::*;
@@ -634,6 +747,23 @@ mod x86_64_impls {
         }
         while i < len {
             c[i] = a[i] + b[i];
+            i += 1;
+        }
+    }
+
+    #[target_feature(enable = "sse2")]
+    pub(super) unsafe fn sub_sse(a: &[f32], b: &[f32], c: &mut [f32], len: usize) {
+        use std::arch::x86_64::*;
+        let mut i = 0;
+        while i + 4 <= len {
+            let va = _mm_loadu_ps(&a[i]);
+            let vb = _mm_loadu_ps(&b[i]);
+            let vc = _mm_sub_ps(va, vb);
+            _mm_storeu_ps(&mut c[i], vc);
+            i += 4;
+        }
+        while i < len {
+            c[i] = a[i] - b[i];
             i += 1;
         }
     }
@@ -655,6 +785,23 @@ mod x86_64_impls {
         }
     }
 
+    #[target_feature(enable = "avx512f")]
+    pub(super) unsafe fn div_avx512(a: &[f32], b: &[f32], c: &mut [f32], len: usize) {
+        use std::arch::x86_64::*;
+        let mut i = 0;
+        while i + 16 <= len {
+            let va = _mm512_loadu_ps(&a[i]);
+            let vb = _mm512_loadu_ps(&b[i]);
+            let vc = _mm512_div_ps(va, vb);
+            _mm512_storeu_ps(&mut c[i], vc);
+            i += 16;
+        }
+        while i < len {
+            c[i] = a[i] / b[i];
+            i += 1;
+        }
+    }
+
     #[target_feature(enable = "avx2")]
     pub(super) unsafe fn mul_avx2(a: &[f32], b: &[f32], c: &mut [f32], len: usize) {
         use std::arch::x86_64::*;
@@ -668,6 +815,23 @@ mod x86_64_impls {
         }
         while i < len {
             c[i] = a[i] * b[i];
+            i += 1;
+        }
+    }
+
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn div_avx2(a: &[f32], b: &[f32], c: &mut [f32], len: usize) {
+        use std::arch::x86_64::*;
+        let mut i = 0;
+        while i + 8 <= len {
+            let va = _mm256_loadu_ps(&a[i]);
+            let vb = _mm256_loadu_ps(&b[i]);
+            let vc = _mm256_div_ps(va, vb);
+            _mm256_storeu_ps(&mut c[i], vc);
+            i += 8;
+        }
+        while i < len {
+            c[i] = a[i] / b[i];
             i += 1;
         }
     }
@@ -689,6 +853,23 @@ mod x86_64_impls {
         }
     }
 
+    #[target_feature(enable = "avx")]
+    pub(super) unsafe fn div_avx(a: &[f32], b: &[f32], c: &mut [f32], len: usize) {
+        use std::arch::x86_64::*;
+        let mut i = 0;
+        while i + 8 <= len {
+            let va = _mm256_loadu_ps(&a[i]);
+            let vb = _mm256_loadu_ps(&b[i]);
+            let vc = _mm256_div_ps(va, vb);
+            _mm256_storeu_ps(&mut c[i], vc);
+            i += 8;
+        }
+        while i < len {
+            c[i] = a[i] / b[i];
+            i += 1;
+        }
+    }
+
     #[target_feature(enable = "sse2")]
     pub(super) unsafe fn mul_sse(a: &[f32], b: &[f32], c: &mut [f32], len: usize) {
         use std::arch::x86_64::*;
@@ -702,6 +883,23 @@ mod x86_64_impls {
         }
         while i < len {
             c[i] = a[i] * b[i];
+            i += 1;
+        }
+    }
+
+    #[target_feature(enable = "sse2")]
+    pub(super) unsafe fn div_sse(a: &[f32], b: &[f32], c: &mut [f32], len: usize) {
+        use std::arch::x86_64::*;
+        let mut i = 0;
+        while i + 4 <= len {
+            let va = _mm_loadu_ps(&a[i]);
+            let vb = _mm_loadu_ps(&b[i]);
+            let vc = _mm_div_ps(va, vb);
+            _mm_storeu_ps(&mut c[i], vc);
+            i += 4;
+        }
+        while i < len {
+            c[i] = a[i] / b[i];
             i += 1;
         }
     }
@@ -1190,6 +1388,23 @@ mod aarch64_impls {
     }
 
     #[target_feature(enable = "neon")]
+    pub(super) unsafe fn sub_neon(a: &[f32], b: &[f32], c: &mut [f32], len: usize) {
+        use std::arch::aarch64::*;
+        let mut i = 0;
+        while i + 4 <= len {
+            let va = vld1q_f32(&a[i]);
+            let vb = vld1q_f32(&b[i]);
+            let vc = vsubq_f32(va, vb);
+            vst1q_f32(&mut c[i], vc);
+            i += 4;
+        }
+        while i < len {
+            c[i] = a[i] - b[i];
+            i += 1;
+        }
+    }
+
+    #[target_feature(enable = "neon")]
     pub(super) unsafe fn mul_neon(a: &[f32], b: &[f32], c: &mut [f32], len: usize) {
         use std::arch::aarch64::*;
         let mut i = 0;
@@ -1202,6 +1417,23 @@ mod aarch64_impls {
         }
         while i < len {
             c[i] = a[i] * b[i];
+            i += 1;
+        }
+    }
+
+    #[target_feature(enable = "neon")]
+    pub(super) unsafe fn div_neon(a: &[f32], b: &[f32], c: &mut [f32], len: usize) {
+        use std::arch::aarch64::*;
+        let mut i = 0;
+        while i + 4 <= len {
+            let va = vld1q_f32(&a[i]);
+            let vb = vld1q_f32(&b[i]);
+            let vc = vdivq_f32(va, vb);
+            vst1q_f32(&mut c[i], vc);
+            i += 4;
+        }
+        while i < len {
+            c[i] = a[i] / b[i];
             i += 1;
         }
     }
