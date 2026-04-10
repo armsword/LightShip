@@ -3,6 +3,7 @@
 //! This module provides end-to-end model execution using the backend.
 
 use std::fmt::Debug;
+use std::sync::Arc;
 use crate::backend::Backend;
 use crate::backend::CompiledOperator;
 use crate::common::{LightShipError, Result};
@@ -10,12 +11,12 @@ use crate::ir::{Graph, OperatorDef, OperatorType, Tensor};
 use std::collections::HashMap;
 
 /// Graph executor for running inference
-pub struct GraphExecutor<'a> {
-    backend: &'a dyn Backend,
+pub struct GraphExecutor {
+    backend: Arc<dyn Backend + Send + Sync>,
     compiled_ops: HashMap<String, CompiledOperator>,
 }
 
-impl<'a> Debug for GraphExecutor<'a> {
+impl Debug for GraphExecutor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GraphExecutor")
             .field("num_compiled_ops", &self.compiled_ops.len())
@@ -23,9 +24,9 @@ impl<'a> Debug for GraphExecutor<'a> {
     }
 }
 
-impl<'a> GraphExecutor<'a> {
-    /// Create a new graph executor
-    pub fn new(backend: &'a dyn Backend) -> Self {
+impl GraphExecutor {
+    /// Create a new graph executor with Arc<dyn Backend>
+    pub fn new(backend: Arc<dyn Backend + Send + Sync>) -> Self {
         Self {
             backend,
             compiled_ops: HashMap::new(),
@@ -56,7 +57,7 @@ impl<'a> GraphExecutor<'a> {
             }
 
             // Compile using backend
-            let compiled = self.backend.compile_operator(&def, &[], &[])?;
+            let compiled = self.backend.as_ref().compile_operator(&def, &[], &[])?;
             self.compiled_ops.insert(node.name.clone(), compiled);
         }
 
@@ -133,7 +134,7 @@ impl<'a> GraphExecutor<'a> {
                 .collect();
 
             // Execute
-            self.backend.execute(
+            self.backend.as_ref().execute(
                 compiled,
                 &input_tensors,
                 &mut output_refs,
@@ -163,18 +164,19 @@ mod tests {
     use crate::backend::CpuBackend;
     use crate::ir::{Graph, Node, NodeIO, OperatorType};
     use crate::common::DataType;
+    use std::sync::Arc;
 
     #[test]
     fn test_graph_executor_creation() {
-        let backend = CpuBackend::new();
-        let executor = GraphExecutor::new(&backend);
+        let backend = Arc::new(CpuBackend::new());
+        let executor = GraphExecutor::new(backend);
         assert!(executor.compiled_ops.is_empty());
     }
 
     #[test]
     fn test_graph_executor_single_relu() {
-        let backend = CpuBackend::new();
-        let mut executor = GraphExecutor::new(&backend);
+        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(CpuBackend::new());
+        let mut executor = GraphExecutor::new(Arc::clone(&backend));
 
         // Create a simple graph: input -> ReLU -> output
         let mut graph = Graph::new("test_relu".to_string());
@@ -228,8 +230,8 @@ mod tests {
 
     #[test]
     fn test_graph_executor_empty_graph() {
-        let backend = CpuBackend::new();
-        let mut executor = GraphExecutor::new(&backend);
+        let backend = Arc::new(CpuBackend::new());
+        let mut executor = GraphExecutor::new(backend);
 
         let graph = Graph::new("empty".to_string());
         executor.prepare(&graph).unwrap();

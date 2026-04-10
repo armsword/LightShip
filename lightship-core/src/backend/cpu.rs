@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 static BLOCK_ID: AtomicU64 = AtomicU64::new(0);
 
 /// CPU Backend implementation
+#[derive(Clone)]
 pub struct CpuBackend {
     config: CpuBackendConfig,
     capabilities: BackendCapabilities,

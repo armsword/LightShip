@@ -11,7 +11,7 @@ pub mod fusion;
 pub mod optimizer;
 
 pub use tensor::{Tensor, TensorData, TensorShape};
-pub use graph::{Graph, Node, NodeId, NodeIO};
+pub use graph::{Graph, GraphIO, Node, NodeId, NodeIO};
 pub use operator::{OperatorDef, OperatorType};
 pub use attribute::{Attribute, AttributeMap, AttributeValue};
 pub use fusion::{FusionInfo, FusionType};
