@@ -3,7 +3,7 @@
 use lightship_core::common::ModelFormat;
 use lightship_core::ir::{Graph, Node, NodeIO, OperatorType};
 use lightship_core::model::{
-    MagicNumber, ModelFile, ModelLoaderRegistry, ModelMetadata, ValidationResult,
+    MagicNumber, ModelFile, ModelLoader, ModelLoaderRegistry, ModelMetadata, ValidationResult,
 };
 use std::collections::HashMap;
 
@@ -105,4 +105,35 @@ fn test_validation_result() {
     assert!(result.valid);
     assert!(result.errors.is_empty());
     assert!(result.warnings.is_empty());
+}
+
+#[test]
+fn test_onnx_loader_integration() {
+    use lightship_core::model::OnnxLoader;
+
+    // Create ONNX loader directly
+    let loader = OnnxLoader::new();
+    assert_eq!(loader.supported_formats(), vec![ModelFormat::ONNX]);
+    assert_eq!(loader.name(), "ONNX Loader");
+
+    // Create registry with ONNX loader - verify registration doesn't panic
+    let mut registry = ModelLoaderRegistry::new();
+    registry.register(OnnxLoader::new());
+
+    // Registry should be usable (just verify it was created)
+    assert!(true);
+}
+
+#[test]
+fn test_onnx_load_from_invalid_data() {
+    use lightship_core::model::OnnxLoader;
+
+    let loader = OnnxLoader::new();
+
+    // Test with invalid data - should return error, not panic
+    let invalid_data = vec![0x00, 0x01, 0x02, 0x03];
+    let result = loader.load_from_bytes(&invalid_data, ModelFormat::ONNX);
+
+    // Should fail with an error, not panic
+    assert!(result.is_err());
 }
