@@ -10,7 +10,7 @@ use crate::backend::memory::StorageLocation;
 use crate::common::{BackendType, DataType, LightShipError, Result, StorageLayout};
 use crate::common::error::BackendError;
 use crate::ir::{OperatorDef, OperatorType, Tensor};
-use crate::platform::{add_simd, detect_simd_level, div_simd, exp_simd, gemm_simd, mul_simd, relu_simd, relu6_simd, sub_simd, tanh_simd, SimdLevel};
+use crate::platform::{add_simd, detect_simd_level, div_scalar_simd, div_simd, exp_simd, gemm_simd, horizontal_sum, mul_simd, relu_simd, relu6_simd, sub_simd, tanh_simd, SimdLevel};
 use std::alloc::{alloc, dealloc, Layout};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -660,32 +660,41 @@ impl CpuBackend {
         let num_elements = input_bytes.len() / 4;
 
         // Read input values
-        let values: Vec<f32> = input_bytes
+        let mut values: Vec<f32> = input_bytes
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
 
-        // Compute softmax: exp(x_i) / sum(exp(x_j))
-        // Subtract max for numerical stability: softmax(x) = exp(x - max) / sum(exp(x - max))
+        let simd_level = detect_simd_level();
+
+        // Find max value for numerical stability (scalar reduction)
         let max_val = values.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
 
-        let exp_values: Vec<f32> = values
-            .iter()
-            .map(|&v| (v - max_val).exp())
-            .collect();
+        // Subtract max: values = values - max_val (scalar subtraction)
+        for v in &mut values {
+            *v = *v - max_val;
+        }
 
-        let sum_exp: f32 = exp_values.iter().sum();
+        // Compute exp(values - max) using SIMD
+        let mut exp_values = vec![0.0f32; num_elements];
+        exp_simd(&values, &mut exp_values, simd_level);
 
-        // Compute output
+        // Sum all exp values using SIMD horizontal sum
+        let sum_exp = horizontal_sum(&exp_values, simd_level);
+
+        // Divide each exp value by sum using SIMD scalar division
+        let mut softmax_values = vec![0.0f32; num_elements];
+        div_scalar_simd(&exp_values, &mut softmax_values, sum_exp, simd_level);
+
+        // Convert to bytes
         let mut output_bytes = Vec::with_capacity(input_bytes.len());
-        for exp_v in exp_values {
-            let softmax = exp_v / sum_exp;
-            output_bytes.extend_from_slice(&softmax.to_le_bytes());
+        for &val in &softmax_values {
+            output_bytes.extend_from_slice(&val.to_le_bytes());
         }
 
         output.data = crate::ir::TensorData::Owned(output_bytes);
 
-        tracing::debug!("CPU Softmax: {} elements, sum_exp={}", num_elements, sum_exp);
+        tracing::debug!("CPU Softmax: {} elements, sum_exp={}, simd={:?}", num_elements, sum_exp, simd_level);
         Ok(())
     }
 
