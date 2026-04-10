@@ -10,7 +10,7 @@ use crate::backend::memory::StorageLocation;
 use crate::common::{BackendType, DataType, LightShipError, Result, StorageLayout};
 use crate::common::error::BackendError;
 use crate::ir::{OperatorDef, OperatorType, Tensor};
-use crate::platform::{add_simd, detect_simd_level, exp_simd, gemm_simd, mul_simd, relu_simd, relu6_simd, SimdLevel};
+use crate::platform::{add_simd, detect_simd_level, exp_simd, gemm_simd, mul_simd, relu_simd, relu6_simd, tanh_simd, SimdLevel};
 use std::alloc::{alloc, dealloc, Layout};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -430,19 +430,29 @@ impl CpuBackend {
         }
 
         let input_bytes = input.data_as_bytes();
+        let num_elements = input_bytes.len() / 4;
 
-        // tanh(x) = (exp(x) - exp(-x)) / (exp(x) + exp(-x))
-        // Rust std library provides tanh directly
+        // Convert bytes to f32 slices
+        let x_f32: Vec<f32> = input_bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+
+        let mut output_f32 = vec![0.0f32; num_elements];
+
+        // Use SIMD acceleration
+        let simd_level = detect_simd_level();
+        tanh_simd(&x_f32, &mut output_f32, simd_level);
+
+        // Convert back to bytes
         let mut output_bytes = Vec::with_capacity(input_bytes.len());
-        for chunk in input_bytes.chunks_exact(4) {
-            let x = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-            let result = x.tanh();
-            output_bytes.extend_from_slice(&result.to_le_bytes());
+        for &val in &output_f32 {
+            output_bytes.extend_from_slice(&val.to_le_bytes());
         }
 
         output.data = crate::ir::TensorData::Owned(output_bytes);
 
-        tracing::debug!("CPU Tanh: executed {} elements", input_bytes.len() / 4);
+        tracing::debug!("CPU Tanh: executed {} elements, simd={:?}", num_elements, simd_level);
         Ok(())
     }
 

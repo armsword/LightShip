@@ -325,6 +325,35 @@ pub fn horizontal_sum(arr: &[f32], level: SimdLevel) -> f32 {
     horizontal_sum_scalar(arr, len)
 }
 
+/// Tanh: tanh(x) = (exp(x) - exp(-x)) / (exp(x) + exp(-x))
+pub fn tanh_simd(input: &[f32], output: &mut [f32], level: SimdLevel) {
+    let len = input.len().min(output.len());
+    if len == 0 {
+        return;
+    }
+
+    // Allocate temporary buffers for exp(x) and exp(-x)
+    let mut exp_x = vec![0.0f32; len];
+    let mut exp_neg_x = vec![0.0f32; len];
+
+    // Compute exp(x)
+    exp_simd(input, &mut exp_x, level);
+
+    // Compute exp(-x) = exp(negate(input))
+    let mut neg_input = vec![0.0f32; len];
+    for i in 0..len {
+        neg_input[i] = -input[i];
+    }
+    exp_simd(&neg_input, &mut exp_neg_x, level);
+
+    // Compute tanh = (exp_x - exp_neg_x) / (exp_x + exp_neg_x)
+    for i in 0..len {
+        let exp_pos = exp_x[i];
+        let exp_neg = exp_neg_x[i];
+        output[i] = (exp_pos - exp_neg) / (exp_pos + exp_neg);
+    }
+}
+
 // ============================================================================
 // Scalar implementations (fallback)
 // ============================================================================
