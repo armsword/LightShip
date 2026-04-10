@@ -10,7 +10,7 @@ use crate::backend::memory::StorageLocation;
 use crate::common::{BackendType, DataType, LightShipError, Result, StorageLayout};
 use crate::common::error::BackendError;
 use crate::ir::{OperatorDef, OperatorType, Tensor};
-use crate::platform::{add_simd, detect_simd_level, mul_simd, relu_simd, relu6_simd, SimdLevel};
+use crate::platform::{add_simd, detect_simd_level, exp_simd, gemm_simd, mul_simd, relu_simd, relu6_simd, SimdLevel};
 use std::alloc::{alloc, dealloc, Layout};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -375,18 +375,43 @@ impl CpuBackend {
         }
 
         let input_bytes = input.data_as_bytes();
+        let num_elements = input_bytes.len() / 4;
 
-        // sigmoid(x) = 1 / (1 + exp(-x))
+        // Convert to f32 slices
+        let x_f32: Vec<f32> = input_bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+
+        let mut neg_x = vec![0.0f32; num_elements];
+        let mut exp_neg_x = vec![0.0f32; num_elements];
+        let mut one_plus_exp = vec![0.0f32; num_elements];
+
+        // neg_x = -x
+        let simd_level = detect_simd_level();
+        for i in 0..num_elements {
+            neg_x[i] = -x_f32[i];
+        }
+
+        // exp_neg_x = exp(-x) using SIMD
+        exp_simd(&neg_x, &mut exp_neg_x, simd_level);
+
+        // sigmoid = 1 / (1 + exp(-x))
+        let mut sigmoid = vec![0.0f32; num_elements];
+        for i in 0..num_elements {
+            one_plus_exp[i] = 1.0 + exp_neg_x[i];
+            sigmoid[i] = 1.0 / one_plus_exp[i];
+        }
+
+        // Convert back to bytes
         let mut output_bytes = Vec::with_capacity(input_bytes.len());
-        for chunk in input_bytes.chunks_exact(4) {
-            let x = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-            let result = 1.0 / (1.0 + (-x).exp());
-            output_bytes.extend_from_slice(&result.to_le_bytes());
+        for &val in &sigmoid {
+            output_bytes.extend_from_slice(&val.to_le_bytes());
         }
 
         output.data = crate::ir::TensorData::Owned(output_bytes);
 
-        tracing::debug!("CPU Sigmoid: executed {} elements", input_bytes.len() / 4);
+        tracing::debug!("CPU Sigmoid: executed {} elements, simd={:?}", num_elements, simd_level);
         Ok(())
     }
 
@@ -765,43 +790,30 @@ impl CpuBackend {
         let input_bytes_a = input_a.data_as_bytes();
         let input_bytes_b = input_b.data_as_bytes();
 
-        // Compute C = A * B
-        // C[i,j] = sum_k A[i,k] * B[k,j]
+        // Convert bytes to f32 slices
+        let a_f32: Vec<f32> = input_bytes_a
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let b_f32: Vec<f32> = input_bytes_b
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let mut c_f32 = vec![0.0f32; m * n];
+
+        // Use SIMD acceleration for GEMM
+        let simd_level = detect_simd_level();
+        gemm_simd(&a_f32, &b_f32, &mut c_f32, *m, *n, k, simd_level);
+
+        // Convert result back to bytes
         let mut output_bytes = Vec::with_capacity(m * n * 4);
-
-        for i in 0..*m {
-            for j in 0..*n {
-                let mut sum = 0.0f32;
-
-                for k_idx in 0..k {
-                    // A[i,k_idx] at index i * k + k_idx
-                    let a_idx = (i * k + k_idx) * 4;
-                    let a_val = f32::from_le_bytes([
-                        input_bytes_a[a_idx],
-                        input_bytes_a[a_idx + 1],
-                        input_bytes_a[a_idx + 2],
-                        input_bytes_a[a_idx + 3],
-                    ]);
-
-                    // B[k_idx,j] at index k_idx * n + j
-                    let b_idx = (k_idx * n + j) * 4;
-                    let b_val = f32::from_le_bytes([
-                        input_bytes_b[b_idx],
-                        input_bytes_b[b_idx + 1],
-                        input_bytes_b[b_idx + 2],
-                        input_bytes_b[b_idx + 3],
-                    ]);
-
-                    sum += a_val * b_val;
-                }
-
-                output_bytes.extend_from_slice(&sum.to_le_bytes());
-            }
+        for &val in &c_f32 {
+            output_bytes.extend_from_slice(&val.to_le_bytes());
         }
 
         output.data = crate::ir::TensorData::Owned(output_bytes);
 
-        tracing::debug!("CPU MatMul: {}x{} @ {}x{} -> {}x{}", m, k, k, n, m, n);
+        tracing::debug!("CPU MatMul: {}x{} @ {}x{} -> {}x{}, simd={:?}", m, k, k, n, m, n, simd_level);
         Ok(())
     }
 
