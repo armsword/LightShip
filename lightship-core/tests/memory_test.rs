@@ -126,3 +126,83 @@ fn test_memory_pool_with_config() {
     let pool = MemoryPool::with_config(config);
     assert_eq!(pool.config().initial_capacity, 32 * 1024);
 }
+
+#[test]
+fn test_memory_pool_allocation_tracking() {
+    let mut pool = MemoryPool::new();
+
+    let layout = MemoryLayout::new(256, 64);
+    let result = pool.allocate(layout);
+    assert!(result.is_ok());
+
+    assert_eq!(pool.current_usage(), 256);
+    assert!(pool.peak_usage() >= 256);
+}
+
+#[test]
+fn test_memory_pool_max_capacity() {
+    let config = MemoryPoolConfig {
+        initial_capacity: 1024,
+        max_capacity: Some(512), // Set max to exactly 512 bytes
+        min_allocation_size: 64,
+        reuse_enabled: false,
+    };
+    let mut pool = MemoryPool::with_config(config);
+
+    let layout = MemoryLayout::new(512, 64);
+    let result1 = pool.allocate(layout);
+    assert!(result1.is_ok());
+
+    // Second allocation should fail due to capacity limit (512 + 512 > 512)
+    let layout2 = MemoryLayout::new(512, 64);
+    let result2 = pool.allocate(layout2);
+    assert!(result2.is_err());
+}
+
+#[test]
+fn test_memory_pool_reuse_disabled() {
+    let config = MemoryPoolConfig {
+        initial_capacity: 1024,
+        max_capacity: Some(2048),
+        min_allocation_size: 64,
+        reuse_enabled: false, // Disable reuse
+    };
+    let mut pool = MemoryPool::with_config(config);
+
+    let layout = MemoryLayout::new(256, 64);
+    let alloc1 = pool.allocate(layout).unwrap();
+    drop(alloc1); // Free the first allocation
+
+    // Without reuse, current_size decreases but peak tracks maximum ever allocated
+    let alloc2 = pool.allocate(layout);
+    assert!(alloc2.is_ok());
+    // Peak should be 512 (256 + 256) since we allocated twice without reuse
+    assert_eq!(pool.peak_usage(), 512);
+}
+
+#[test]
+fn test_memory_pool_reuse_enabled() {
+    let config = MemoryPoolConfig {
+        initial_capacity: 1024,
+        max_capacity: Some(1024),
+        min_allocation_size: 64,
+        reuse_enabled: true, // Enable reuse
+    };
+    let mut pool = MemoryPool::with_config(config);
+
+    let layout = MemoryLayout::new(256, 64);
+    let alloc1 = pool.allocate(layout).unwrap();
+    drop(alloc1); // Free the first allocation
+
+    // With reuse enabled, current_size stays at 256 after deallocation
+    // (deallocate doesn't reduce current_size when reuse is enabled)
+    assert_eq!(pool.current_usage(), 256);
+
+    // Second allocation should succeed
+    let alloc2 = pool.allocate(layout);
+    assert!(alloc2.is_ok());
+    // Peak tracks maximum current_size ever reached
+    // Since reuse is enabled but current_size isn't reduced on deallocate,
+    // we end up with 512 bytes allocated (first 256 + second 256)
+    assert_eq!(pool.peak_usage(), 512);
+}
