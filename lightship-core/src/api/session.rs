@@ -235,4 +235,94 @@ mod tests {
 
         assert_eq!(output_data, vec![0.0, 0.0, 1.0, 2.0, 0.0, 3.0]);
     }
+
+    #[test]
+    fn test_session_multi_node_graph() {
+        // Test a graph with two ReLU nodes: input -> relu1 -> relu2 -> output
+        // After first ReLU: [-1, 0, 2, -3] -> [0, 0, 2, 0]
+        // After second ReLU: [0, 0, 2, 0] -> [0, 0, 2, 0] (no change, all >= 0)
+        let mut session = SessionHandle::new().unwrap();
+
+        let mut graph = Graph::new("test_multi".to_string());
+
+        // First ReLU node
+        let mut relu1 = Node::new(0, "relu1".to_string(), OperatorType::ReLU);
+        relu1.inputs.push(NodeIO {
+            tensor_name: "input".to_string(),
+            data_type: DataType::F32,
+        });
+        relu1.outputs.push(NodeIO {
+            tensor_name: "intermediate".to_string(),
+            data_type: DataType::F32,
+        });
+        graph.add_node(relu1);
+
+        // Second ReLU node
+        let mut relu2 = Node::new(1, "relu2".to_string(), OperatorType::ReLU);
+        relu2.inputs.push(NodeIO {
+            tensor_name: "intermediate".to_string(),
+            data_type: DataType::F32,
+        });
+        relu2.outputs.push(NodeIO {
+            tensor_name: "output".to_string(),
+            data_type: DataType::F32,
+        });
+        graph.add_node(relu2);
+
+        // Set up graph inputs and outputs
+        graph.inputs.push(crate::ir::GraphIO {
+            name: "input".to_string(),
+            io: NodeIO {
+                tensor_name: "input".to_string(),
+                data_type: DataType::F32,
+            },
+            is_model_input: true,
+            is_model_output: false,
+        });
+        graph.outputs.push(crate::ir::GraphIO {
+            name: "output".to_string(),
+            io: NodeIO {
+                tensor_name: "output".to_string(),
+                data_type: DataType::F32,
+            },
+            is_model_input: false,
+            is_model_output: true,
+        });
+
+        session.prepare_graph(graph).unwrap();
+        assert!(session.is_prepared());
+
+        // Input: [-1.0, 0.0, 2.0, -3.0]
+        // After first ReLU: [0.0, 0.0, 2.0, 0.0]
+        // After second ReLU: [0.0, 0.0, 2.0, 0.0]
+        let input_data: Vec<f32> = vec![-1.0, 0.0, 2.0, -3.0];
+        let input = crate::ir::Tensor::from_data("input".to_string(), vec![4], DataType::F32, input_data);
+
+        let mut outputs_arr: &mut [(&str, crate::ir::Tensor)] = &mut [
+            ("output", crate::ir::Tensor::new("output".to_string(), vec![4], DataType::F32))
+        ];
+        session.forward(&[("input", input)], outputs_arr).unwrap();
+
+        let output_bytes = outputs_arr[0].1.data_as_bytes();
+        let output_data: Vec<f32> = output_bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+
+        // Both ReLUs should produce [0, 0, 2, 0]
+        assert_eq!(output_data, vec![0.0, 0.0, 2.0, 0.0]);
+    }
+
+    #[test]
+    fn test_session_not_prepared_error() {
+        let session = SessionHandle::new().unwrap();
+
+        let input = crate::ir::Tensor::new("input".to_string(), vec![4], DataType::F32);
+        let mut outputs_arr: &mut [(&str, crate::ir::Tensor)] = &mut [
+            ("output", crate::ir::Tensor::new("output".to_string(), vec![4], DataType::F32))
+        ];
+
+        let result = session.forward(&[("input", input)], outputs_arr);
+        assert!(result.is_err());
+    }
 }
