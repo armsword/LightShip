@@ -4,7 +4,9 @@ use crate::common::{BackendType, InferenceMode, LightShipError, Result};
 use crate::executor::GraphExecutor;
 use crate::ir::Graph;
 use crate::backend::CpuBackend;
+use crate::model::{ModelFile, ModelLoaderRegistry};
 use std::fmt::Debug;
+use std::path::Path;
 use std::sync::Arc;
 
 /// Session configuration
@@ -73,6 +75,14 @@ impl SessionHandle {
             input_names: Vec::new(),
             output_names: Vec::new(),
         })
+    }
+
+    /// Load a model from file and prepare for execution
+    pub fn load_model<P: AsRef<Path>>(&mut self, path: P) -> Result<ModelFile> {
+        let registry = crate::model::create_default_registry();
+        let model = registry.load(path.as_ref())?;
+        self.prepare_graph(model.graph.clone())?;
+        Ok(model)
     }
 
     /// Prepare a graph for execution
@@ -323,6 +333,14 @@ mod tests {
         ];
 
         let result = session.forward(&[("input", input)], outputs_arr);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_session_load_model_invalid_path() {
+        // Test loading a non-existent model file
+        let mut session = SessionHandle::new().unwrap();
+        let result = session.load_model("/nonexistent/path/model.onnx");
         assert!(result.is_err());
     }
 }
