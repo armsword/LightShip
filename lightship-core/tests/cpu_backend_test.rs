@@ -922,3 +922,97 @@ fn test_cpu_backend_execute_fullyconnected() {
     assert!((output_data[1] - 20.0).abs() < tolerance);
     assert!((output_data[2] - 30.0).abs() < tolerance);
 }
+
+#[test]
+fn test_cpu_backend_conv2d_relu_chain() {
+    // Test chain: Conv2d -> ReLU
+    let backend = CpuBackend::new();
+
+    // First: Conv2d
+    let mut conv_def = OperatorDef::new("conv".into(), OperatorType::Conv2d);
+    conv_def.inputs.push(NodeIO {
+        tensor_name: "input".into(),
+        data_type: DataType::F32,
+    });
+    conv_def.inputs.push(NodeIO {
+        tensor_name: "filter".into(),
+        data_type: DataType::F32,
+    });
+    conv_def.outputs.push(NodeIO {
+        tensor_name: "conv_out".into(),
+        data_type: DataType::F32,
+    });
+
+    // Input: [1, 1, 4, 4] - single channel 4x4
+    let input = Tensor::from_data(
+        "input".into(),
+        vec![1, 1, 4, 4],
+        DataType::F32,
+        vec![
+            // Row 0
+            1.0f32, 2.0, 3.0, 4.0,
+            // Row 1
+            5.0f32, 6.0, 7.0, 8.0,
+            // Row 2
+            1.0f32, 2.0, 3.0, 4.0,
+            // Row 3
+            5.0f32, 6.0, 7.0, 8.0,
+        ],
+    );
+
+    // Filter: [1, 1, 2, 2] - single 2x2 kernel, output 1 channel
+    let filter = Tensor::from_data(
+        "filter".into(),
+        vec![1, 1, 2, 2],
+        DataType::F32,
+        vec![
+            1.0f32, 0.0,
+            0.0f32, 1.0f32,
+        ],
+    );
+
+    let mut conv_output = Tensor::new("conv_out".into(), vec![1, 1, 3, 3], DataType::F32);
+
+    let conv_compiled = backend
+        .compile_operator(&conv_def, &[&input, &filter], &[&conv_output])
+        .unwrap();
+
+    let result = backend.execute(&conv_compiled, &[&input, &filter], &mut [&mut conv_output]);
+    assert!(result.is_ok());
+
+    // Verify conv output exists and has correct shape
+    let conv_bytes = conv_output.data_as_bytes();
+    assert_eq!(conv_bytes.len(), 1 * 1 * 3 * 3 * 4); // 36 bytes for 9 f32 values
+
+    // Second: ReLU on conv output
+    let mut relu_def = OperatorDef::new("relu".into(), OperatorType::ReLU);
+    relu_def.inputs.push(NodeIO {
+        tensor_name: "conv_out".into(),
+        data_type: DataType::F32,
+    });
+    relu_def.outputs.push(NodeIO {
+        tensor_name: "relu_out".into(),
+        data_type: DataType::F32,
+    });
+
+    let mut relu_output = Tensor::new("relu_out".into(), vec![1, 1, 3, 3], DataType::F32);
+
+    let relu_compiled = backend
+        .compile_operator(&relu_def, &[&conv_output], &[&relu_output])
+        .unwrap();
+
+    let result = backend.execute(&relu_compiled, &[&conv_output], &mut [&mut relu_output]);
+    assert!(result.is_ok());
+
+    // Verify ReLU output: max(conv_out, 0)
+    let relu_bytes = relu_output.data_as_bytes();
+    let relu_data: Vec<f32> = relu_bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+
+    // All values should be non-negative after ReLU
+    for val in &relu_data {
+        assert!(*val >= 0.0, "ReLU output should be non-negative, got {}", val);
+    }
+}
