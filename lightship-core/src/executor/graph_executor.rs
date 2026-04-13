@@ -3,6 +3,7 @@
 //! This module provides end-to-end model execution using the backend.
 
 use std::fmt::Debug;
+use std::ops::Deref;
 use std::sync::Arc;
 use crate::backend::Backend;
 use crate::backend::CompiledOperator;
@@ -73,16 +74,20 @@ impl GraphExecutor {
         outputs: &mut [(&str, Tensor)],
     ) -> Result<()> {
         // Create tensor storage for intermediate results
-        let mut tensor_storage: HashMap<String, Tensor> = HashMap::new();
+        // Use Arc to share tensor data without deep cloning
+        let mut tensor_storage: HashMap<String, Arc<Tensor>> = HashMap::new();
 
-        // Register input tensors
+        // Build a map from output name to index for quick lookup (use String to avoid borrow issues)
+        let output_names: Vec<String> = outputs.iter().map(|(name, _)| name.to_string()).collect();
+        let output_indices: HashMap<&str, usize> = output_names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| (name.as_str(), i))
+            .collect();
+
+        // Register input tensors - Arc clone is cheap (just reference count increment)
         for (name, tensor) in inputs {
-            tensor_storage.insert(name.to_string(), tensor.clone());
-        }
-
-        // Register output tensors (pre-allocated by caller)
-        for (name, tensor) in outputs.iter_mut() {
-            tensor_storage.insert(name.to_string(), tensor.clone());
+            tensor_storage.insert(name.to_string(), Arc::new(tensor.clone()));
         }
 
         // Get topological order
@@ -95,17 +100,16 @@ impl GraphExecutor {
                 .find(|n| n.id == node_id)
                 .ok_or_else(|| LightShipError::InvalidParam(format!("Node {} not found", node_id)))?;
 
-            // Get or create input tensors
-            // Check tensor_storage first (runtime data), then graph.variables (static weights)
-            let mut input_tensors: Vec<Tensor> = Vec::new();
+            // Get input tensors - use Arc clone to share data
+            let mut input_tensors: Vec<Arc<Tensor>> = Vec::new();
             for input in &node.inputs {
                 if let Some(tensor) = tensor_storage.get(&input.tensor_name) {
-                    input_tensors.push(tensor.clone());
+                    input_tensors.push(Arc::clone(tensor));
                 } else if let Some(var_tensor) = graph.variables.get(&input.tensor_name) {
                     // Use variable (initializer/weight) from graph
                     tracing::debug!("Using initializer {} for node {}", input.tensor_name, node.name);
                     tracing::debug!("  shape: {:?}, data_len: {}", var_tensor.shape, var_tensor.data_as_bytes().len());
-                    input_tensors.push(var_tensor.as_ref().clone());
+                    input_tensors.push(Arc::clone(var_tensor));
                 } else {
                     // Create a placeholder tensor for missing inputs
                     tracing::warn!("Input tensor {} not found for node {}, using placeholder",
@@ -115,38 +119,49 @@ impl GraphExecutor {
                         vec![1],
                         input.data_type,
                     );
-                    tensor_storage.insert(input.tensor_name.clone(), placeholder.clone());
-                    input_tensors.push(placeholder);
+                    let placeholder_arc = Arc::new(placeholder);
+                    tensor_storage.insert(input.tensor_name.clone(), Arc::clone(&placeholder_arc));
+                    input_tensors.push(placeholder_arc);
                 }
             }
-            let input_tensor_refs: Vec<&Tensor> = input_tensors.iter().collect();
 
-            // Get output tensors from storage (pre-allocated by caller)
-            let mut output_tensors: Vec<Tensor> = node.outputs.iter()
-                .map(|output| {
-                    tensor_storage.get(&output.tensor_name)
-                        .cloned()
-                        .unwrap_or_else(|| {
-                            // Create placeholder tensor - should not reach here if caller provided outputs
-                            Tensor::new(
-                                output.tensor_name.clone(),
-                                vec![1],
-                                output.data_type,
-                            )
-                        })
-                })
-                .collect();
+            // Convert Arc<Tensor> to &Tensor for backend execute
+            let input_tensor_refs: Vec<&Tensor> = input_tensors.iter().map(|t| t.as_ref()).collect();
+
+            // Get output tensors - create new or get from storage
+            // For each output, we need a mutable Tensor to pass to execute
+            let mut output_arcs: Vec<Arc<Tensor>> = Vec::new();
+            let mut output_refs: Vec<&mut Tensor> = Vec::new();
+
+            for output in &node.outputs {
+                // Check if this is a model output (pre-allocated by caller)
+                let is_model_output = output_indices.contains_key(output.tensor_name.as_str());
+
+                let tensor_arc = if is_model_output {
+                    // For model outputs, we need to use the actual output tensor from caller
+                    // Get the mutable reference from outputs array
+                    let idx = *output_indices.get(output.tensor_name.as_str()).unwrap();
+                    // Clone the tensor and we'll track that this should be written back
+                    Arc::new(outputs[idx].1.clone())
+                } else if let Some(existing) = tensor_storage.get(&output.tensor_name) {
+                    Arc::clone(existing)
+                } else {
+                    Arc::new(Tensor::new(output.tensor_name.clone(), vec![1], output.data_type))
+                };
+
+                output_arcs.push(Arc::clone(&tensor_arc));
+
+                // Get mutable reference for execute
+                // Safety: We ensure single-threaded execution and exclusive access pattern
+                let tensor_ptr = Arc::as_ptr(&tensor_arc) as *mut Tensor;
+                output_refs.push(unsafe { &mut *tensor_ptr });
+            }
 
             // Get compiled operator
             let compiled = self.compiled_ops.get(&node.name)
                 .ok_or_else(|| LightShipError::InvalidParam(
                     format!("Compiled operator {} not found", node.name)
                 ))?;
-
-            // Convert output refs
-            let mut output_refs: Vec<&mut Tensor> = output_tensors.iter_mut()
-                .map(|t| t as &mut Tensor)
-                .collect();
 
             // Execute
             self.backend.as_ref().execute(
@@ -155,16 +170,19 @@ impl GraphExecutor {
                 &mut output_refs,
             )?;
 
-            // Store outputs back to tensor_storage
+            // Store outputs back to tensor_storage and update model outputs
             for (i, output) in node.outputs.iter().enumerate() {
-                tensor_storage.insert(output.tensor_name.clone(), output_tensors[i].clone());
-            }
-        }
+                let tensor_arc = &output_arcs[i];
+                let is_model_output = output_indices.contains_key(output.tensor_name.as_str());
 
-        // Copy output tensors back to caller
-        for (name, output_tensor) in outputs.iter_mut() {
-            if let Some(tensor) = tensor_storage.get(*name) {
-                output_tensor.data = tensor.data.clone();
+                if is_model_output {
+                    // Update the actual output tensor in the outputs array
+                    let idx = *output_indices.get(output.tensor_name.as_str()).unwrap();
+                    outputs[idx].1.data = tensor_arc.data.clone();
+                } else {
+                    // Store intermediate result in tensor_storage
+                    tensor_storage.insert(output.tensor_name.clone(), Arc::clone(tensor_arc));
+                }
             }
         }
 

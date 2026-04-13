@@ -22,6 +22,10 @@ static BLOCK_ID: AtomicU64 = AtomicU64::new(0);
 pub struct CpuBackend {
     config: CpuBackendConfig,
     capabilities: BackendCapabilities,
+    /// Scratch buffer for intermediate f32 data (reused across calls)
+    scratch_f32: Vec<f32>,
+    /// Scratch buffer for output bytes (reused across calls)
+    scratch_bytes: Vec<u8>,
 }
 
 impl Debug for CpuBackend {
@@ -45,6 +49,9 @@ impl CpuBackend {
         Self {
             config,
             capabilities,
+            // Pre-allocate scratch buffers for reuse (8MB each)
+            scratch_f32: Vec::with_capacity(8 * 1024 * 1024 / 4),
+            scratch_bytes: Vec::with_capacity(8 * 1024 * 1024),
         }
     }
 
