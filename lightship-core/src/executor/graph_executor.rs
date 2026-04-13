@@ -96,15 +96,27 @@ impl GraphExecutor {
                 .ok_or_else(|| LightShipError::InvalidParam(format!("Node {} not found", node_id)))?;
 
             // Get or create input tensors
-            let input_tensors: Vec<&Tensor> = node.inputs.iter()
-                .map(|input| {
-                    tensor_storage.get(&input.tensor_name)
-                        .ok_or_else(|| LightShipError::InvalidParam(
-                            format!("Input tensor {} not found for node {}", input.tensor_name, node.name)
-                        ))
-                        .map(|t| t as &Tensor)
-                })
-                .collect::<Result<Vec<_>>>()?;
+            // Note: For now, we create placeholder tensors for missing inputs (e.g., weights from initializers)
+            // This is a temporary solution until we properly parse initializers
+            let mut input_tensors: Vec<Tensor> = Vec::new();
+            for input in &node.inputs {
+                if let Some(tensor) = tensor_storage.get(&input.tensor_name) {
+                    input_tensors.push(tensor.clone());
+                } else {
+                    // Create a placeholder tensor for missing inputs (e.g., weights)
+                    // This is temporary - proper initializers parsing is needed
+                    tracing::warn!("Input tensor {} not found for node {}, using placeholder",
+                        input.tensor_name, node.name);
+                    let placeholder = Tensor::new(
+                        input.tensor_name.clone(),
+                        vec![1],
+                        input.data_type,
+                    );
+                    tensor_storage.insert(input.tensor_name.clone(), placeholder.clone());
+                    input_tensors.push(placeholder);
+                }
+            }
+            let input_tensor_refs: Vec<&Tensor> = input_tensors.iter().collect();
 
             // Get output tensors from storage (pre-allocated by caller)
             let mut output_tensors: Vec<Tensor> = node.outputs.iter()
@@ -136,7 +148,7 @@ impl GraphExecutor {
             // Execute
             self.backend.as_ref().execute(
                 compiled,
-                &input_tensors,
+                &input_tensor_refs,
                 &mut output_refs,
             )?;
 

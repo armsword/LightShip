@@ -176,7 +176,7 @@ impl OnnxLoader {
         let mut graph = Graph::new("onnx_model".to_string());
         let mut offset = 0;
 
-        // Simple protobuf parsing
+        // Simple protobuf parsing - process based on wire_type, skip unknown fields
         while offset < data.len() {
             let (field_number, wire_type, new_offset) = match self.read_tag(data, offset) {
                 Some(v) => v,
@@ -184,54 +184,55 @@ impl OnnxLoader {
             };
             offset = new_offset;
 
-            match field_number {
-                1 => {
-                    // producer_name
+            match (field_number, wire_type) {
+                // field 1: ir_version (varint)
+                (1, 0) => {
+                    offset = self.skip_field(data, offset, wire_type)?;
+                }
+                // field 2: producer_name (string)
+                (2, 2) => {
                     if let Ok((str_val, new_offset)) = self.read_string(data, offset) {
                         graph.name = str_val;
                         offset = new_offset;
+                    } else {
+                        offset = self.skip_field(data, offset, wire_type)?;
                     }
                 }
-                2 => {
-                    // producer_version
-                    if let Ok((_, new_offset)) = self.read_string(data, offset) {
-                        offset = new_offset;
-                    }
-                }
-                3 => {
-                    // domain
-                    if let Ok((_, new_offset)) = self.read_string(data, offset) {
-                        offset = new_offset;
-                    }
-                }
-                4 => {
-                    // model_version
-                    if let Ok((_, new_offset)) = self.read_varint(data, offset) {
-                        offset = new_offset;
-                    }
-                }
-                5 => {
-                    // doc_string
-                    if let Ok((_, new_offset)) = self.read_string(data, offset) {
-                        offset = new_offset;
-                    }
-                }
-                6 => {
-                    // opset_import - skip for now
+                // field 3: producer_version (string)
+                (3, 2) => {
                     offset = self.skip_field(data, offset, wire_type)?;
                 }
-                7 => {
-                    // graph
+                // field 4: domain (string)
+                (4, 2) => {
                     offset = self.skip_field(data, offset, wire_type)?;
+                }
+                // field 5: model_version (varint)
+                (5, 0) => {
+                    offset = self.skip_field(data, offset, wire_type)?;
+                }
+                // field 6: doc_string (string)
+                (6, 2) => {
+                    offset = self.skip_field(data, offset, wire_type)?;
+                }
+                // field 7: graph (length-delimited message)
+                (7, 2) => {
+                    let (graph_len, after_len_offset) = self.read_varint(data, offset)?;
+                    let graph_end = after_len_offset + graph_len as usize;
 
-                    // Try to parse nodes manually
-                    let (nodes, graph_outputs, new_offset) = self.parse_nodes_from_graph(data, offset)?;
+                    // Parse nodes from graph content
+                    let (nodes, graph_outputs) = self.parse_nodes_from_graph(data, after_len_offset, graph_end)?;
                     graph.nodes = nodes;
                     graph.outputs = graph_outputs;
-                    offset = new_offset;
+
+                    // Move offset past the entire graph field
+                    offset = graph_end;
                 }
+                // field 8: opset_import (message, skip)
+                (8, 2) => {
+                    offset = self.skip_field(data, offset, wire_type)?;
+                }
+                // Unknown field - skip
                 _ => {
-                    // Unknown field, skip
                     offset = self.skip_field(data, offset, wire_type)?;
                 }
             }
@@ -247,50 +248,48 @@ impl OnnxLoader {
     }
 
     /// Parse nodes from graph body
-    fn parse_nodes_from_graph(&self, data: &[u8], mut offset: usize) -> StdResult<(Vec<Node>, Vec<GraphIO>, usize), ModelLoaderError> {
+    fn parse_nodes_from_graph(&self, data: &[u8], mut offset: usize, end: usize) -> StdResult<(Vec<Node>, Vec<GraphIO>), ModelLoaderError> {
         let mut nodes = Vec::new();
         let mut outputs = Vec::new();
         let mut node_id = 0;
 
-        // Look for node entries (field 9 in GraphProto)
-        while offset < data.len() {
+        // Look for node entries (field 1 in GraphProto per ONNX spec)
+        while offset < end {
             let (field_number, wire_type, new_offset) = match self.read_tag(data, offset) {
                 Some(v) => v,
                 None => break,
             };
 
-            if field_number == 9 {
-                // This is a node
-                let node_offset = new_offset;
-                let (node, new_offset) = self.parse_node(data, node_offset, node_id)?;
-                nodes.push(node);
-                offset = new_offset;
-                node_id += 1;
-            } else if field_number == 11 {
-                // input (ValueInfoProto) - field 11
-                offset = self.skip_field(data, new_offset, wire_type)?;
-            } else if field_number == 12 {
-                // output (ValueInfoProto) - field 12
-                if let Some(output_io) = self.parse_value_info(data, new_offset)? {
-                    outputs.push(output_io);
+            match (field_number, wire_type) {
+                (1, 2) => {
+                    // NodeProto - length-delimited
+                    let (content_len, len_bytes) = {
+                        let (len, pos) = self.read_varint(data, new_offset)?;
+                        (len as usize, pos - new_offset)
+                    };
+                    let content_start = new_offset + len_bytes;
+                    let content_end = content_start + content_len;
+                    let (node, _) = self.parse_node(data, content_start, node_id)?;
+                    nodes.push(node);
+                    offset = content_end;
+                    node_id += 1;
                 }
-                // Try to continue parsing after the field
-                offset = self.skip_field(data, new_offset, wire_type)?;
-            } else if field_number == 8 {
-                // name - string
-                offset = self.skip_field(data, new_offset, wire_type)?;
-            } else if field_number == 13 {
-                // initializer - skip
-                offset = self.skip_field(data, new_offset, wire_type)?;
-            } else if field_number == 14 {
-                // sparse_initializer - skip
-                offset = self.skip_field(data, new_offset, wire_type)?;
-            } else {
-                offset = self.skip_field(data, new_offset, wire_type)?;
+                (11, 2) => {
+                    // ValueInfoProto for input - skip for now
+                    offset = self.skip_field(data, new_offset, wire_type)?;
+                }
+                (12, 2) => {
+                    // ValueInfoProto for output - skip for now
+                    offset = self.skip_field(data, new_offset, wire_type)?;
+                }
+                _ => {
+                    // Skip any other fields
+                    offset = self.skip_field(data, new_offset, wire_type)?;
+                }
             }
         }
 
-        Ok((nodes, outputs, offset))
+        Ok((nodes, outputs))
     }
 
     /// Parse a single node (NodeProto)
@@ -309,7 +308,19 @@ impl OnnxLoader {
 
             match field_number {
                 1 => {
-                    // output (repeated string)
+                    // input (repeated string) - field 1 in actual ONNX bytes is input tensor name
+                    if let Ok((str_val, read_offset)) = self.read_string(data, new_offset) {
+                        inputs.push(NodeIO {
+                            tensor_name: str_val,
+                            data_type: DataType::F32,
+                        });
+                        current_offset = read_offset;
+                    } else {
+                        current_offset = self.skip_field(data, new_offset, wire_type)?;
+                    }
+                }
+                2 => {
+                    // output (repeated string) - field 2 in actual ONNX bytes is output tensor name
                     if let Ok((str_val, read_offset)) = self.read_string(data, new_offset) {
                         outputs.push(NodeIO {
                             tensor_name: str_val,
@@ -320,22 +331,10 @@ impl OnnxLoader {
                         current_offset = self.skip_field(data, new_offset, wire_type)?;
                     }
                 }
-                2 => {
-                    // name
+                3 => {
+                    // name (string) - according to ONNX spec
                     if let Ok((str_val, read_offset)) = self.read_string(data, new_offset) {
                         name = str_val;
-                        current_offset = read_offset;
-                    } else {
-                        current_offset = self.skip_field(data, new_offset, wire_type)?;
-                    }
-                }
-                3 => {
-                    // input (repeated string)
-                    if let Ok((str_val, read_offset)) = self.read_string(data, new_offset) {
-                        inputs.push(NodeIO {
-                            tensor_name: str_val,
-                            data_type: DataType::F32,
-                        });
                         current_offset = read_offset;
                     } else {
                         current_offset = self.skip_field(data, new_offset, wire_type)?;
@@ -350,19 +349,12 @@ impl OnnxLoader {
                         current_offset = self.skip_field(data, new_offset, wire_type)?;
                     }
                 }
-                5 => {
-                    // attribute - skip for now
-                    current_offset = self.skip_field(data, new_offset, wire_type)?;
-                }
-                6 => {
-                    // doc_string - skip
-                    current_offset = self.skip_field(data, new_offset, wire_type)?;
-                }
-                7 => {
-                    // domain - skip
+                5 | 6 | 7 => {
+                    // attribute, doc_string, domain - skip
                     current_offset = self.skip_field(data, new_offset, wire_type)?;
                 }
                 _ => {
+                    // Unknown field - skip
                     current_offset = self.skip_field(data, new_offset, wire_type)?;
                 }
             }
