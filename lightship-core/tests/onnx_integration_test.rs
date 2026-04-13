@@ -32,6 +32,14 @@ fn test_load_simple_relu_model() {
     let model = result.unwrap();
     assert_eq!(model.num_operators(), 1);
     assert_eq!(model.graph.nodes.len(), 1);
+
+    // Verify inputs and outputs are parsed
+    assert!(!model.graph.inputs.is_empty(), "Model should have inputs");
+    assert!(!model.graph.outputs.is_empty(), "Model should have outputs");
+    assert_eq!(model.graph.inputs.len(), 1, "Model should have 1 input");
+    assert_eq!(model.graph.outputs.len(), 1, "Model should have 1 output");
+    assert_eq!(model.graph.inputs[0].name, "input");
+    assert_eq!(model.graph.outputs[0].name, "output");
 }
 
 #[test]

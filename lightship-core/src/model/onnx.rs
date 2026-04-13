@@ -221,8 +221,9 @@ impl OnnxLoader {
                     let graph_end = after_len_offset + graph_len as usize;
 
                     // Parse nodes from graph content
-                    let (nodes, graph_outputs, graph_variables) = self.parse_nodes_from_graph(data, after_len_offset, graph_end)?;
+                    let (nodes, graph_inputs, graph_outputs, graph_variables) = self.parse_nodes_from_graph(data, after_len_offset, graph_end)?;
                     graph.nodes = nodes;
+                    graph.inputs = graph_inputs;
                     graph.outputs = graph_outputs;
                     graph.variables = graph_variables;
 
@@ -250,9 +251,10 @@ impl OnnxLoader {
     }
 
     /// Parse nodes from graph body
-    /// Returns (nodes, outputs, variables)
-    fn parse_nodes_from_graph(&self, data: &[u8], mut offset: usize, end: usize) -> StdResult<(Vec<Node>, Vec<GraphIO>, std::collections::HashMap<String, Arc<crate::ir::Tensor>>), ModelLoaderError> {
+    /// Returns (nodes, inputs, outputs, variables)
+    fn parse_nodes_from_graph(&self, data: &[u8], mut offset: usize, end: usize) -> StdResult<(Vec<Node>, Vec<GraphIO>, Vec<GraphIO>, std::collections::HashMap<String, Arc<crate::ir::Tensor>>), ModelLoaderError> {
         let mut nodes = Vec::new();
+        let mut inputs = Vec::new();
         let mut outputs = Vec::new();
         let mut variables: std::collections::HashMap<String, Arc<crate::ir::Tensor>> = std::collections::HashMap::new();
         let mut node_id = 0;
@@ -293,12 +295,30 @@ impl OnnxLoader {
                     offset = content_end;
                 }
                 (11, 2) => {
-                    // ValueInfoProto for input - skip for now
-                    offset = self.skip_field(data, new_offset, wire_type)?;
+                    // ValueInfoProto for input
+                    let (content_len, len_bytes) = {
+                        let (len, pos) = self.read_varint(data, new_offset)?;
+                        (len as usize, pos - new_offset)
+                    };
+                    let content_start = new_offset + len_bytes;
+                    let content_end = content_start + content_len;
+                    if let Some(graph_io) = self.parse_value_info_proto(data, content_start, content_end, true)? {
+                        inputs.push(graph_io);
+                    }
+                    offset = content_end;
                 }
                 (12, 2) => {
-                    // ValueInfoProto for output - skip for now
-                    offset = self.skip_field(data, new_offset, wire_type)?;
+                    // ValueInfoProto for output
+                    let (content_len, len_bytes) = {
+                        let (len, pos) = self.read_varint(data, new_offset)?;
+                        (len as usize, pos - new_offset)
+                    };
+                    let content_start = new_offset + len_bytes;
+                    let content_end = content_start + content_len;
+                    if let Some(graph_io) = self.parse_value_info_proto(data, content_start, content_end, false)? {
+                        outputs.push(graph_io);
+                    }
+                    offset = content_end;
                 }
                 _ => {
                     // Skip any other fields
@@ -307,7 +327,7 @@ impl OnnxLoader {
             }
         }
 
-        Ok((nodes, outputs, variables))
+        Ok((nodes, inputs, outputs, variables))
     }
 
     /// Parse TensorProto (initializer)
@@ -431,6 +451,105 @@ impl OnnxLoader {
         };
 
         Ok(Some(tensor))
+    }
+
+    /// Parse ValueInfoProto (input/output definition)
+    /// Returns GraphIO if parsing succeeds
+    fn parse_value_info_proto(&self, data: &[u8], offset: usize, end: usize, is_input: bool) -> StdResult<Option<GraphIO>, ModelLoaderError> {
+        let mut name = String::new();
+        let mut dtype = crate::common::DataType::F32;
+
+        let mut pos = offset;
+        while pos < end && pos < data.len() {
+            let (field_number, wire_type, new_offset) = match self.read_tag(data, pos) {
+                Some(v) => v,
+                None => break,
+            };
+            pos = new_offset;
+
+            match (field_number, wire_type) {
+                (1, 2) => {
+                    // name (string)
+                    if let Ok((str_val, new_pos)) = self.read_string(data, pos) {
+                        name = str_val;
+                        pos = new_pos;
+                    }
+                }
+                (2, 2) => {
+                    // type (TypeProto) - length-delimited
+                    let (content_len, len_bytes) = {
+                        let (len, p) = self.read_varint(data, pos)?;
+                        (len as usize, p - pos)
+                    };
+                    let type_end = pos + len_bytes + content_len;
+                    // Parse embedded TypeProto to get tensor_type.elem_type
+                    let mut type_pos = pos + len_bytes;
+                    while type_pos < type_end && type_pos < data.len() {
+                        let (type_field, type_wire, type_new) = match self.read_tag(data, type_pos) {
+                            Some(v) => v,
+                            None => break,
+                        };
+                        type_pos = type_new;
+
+                        if type_field == 1 && type_wire == 2 {
+                            // tensor_type
+                            let (tensor_len, tensor_len_bytes) = {
+                                let (len, p) = self.read_varint(data, type_pos)?;
+                                (len as usize, p - type_pos)
+                            };
+                            let tensor_end = type_pos + tensor_len_bytes + tensor_len;
+                            let mut elem_type_pos = type_pos + tensor_len_bytes;
+                            while elem_type_pos < tensor_end && elem_type_pos < data.len() {
+                                let (et_field, et_wire, et_new) = match self.read_tag(data, elem_type_pos) {
+                                    Some(v) => v,
+                                    None => break,
+                                };
+                                elem_type_pos = et_new;
+                                if et_field == 1 && et_wire == 0 {
+                                    // elem_type
+                                    if let Some((val, _)) = self.read_varint_raw(data, elem_type_pos) {
+                                        dtype = match val as i32 {
+                                            1 => crate::common::DataType::F32,
+                                            7 => crate::common::DataType::I32,
+                                            _ => crate::common::DataType::F32,
+                                        };
+                                    }
+                                } else if et_field == 2 {
+                                    // shape
+                                    // Could parse dimensions here if needed
+                                }
+                                if et_wire == 2 || et_new >= tensor_end {
+                                    break;
+                                }
+                                elem_type_pos = self.skip_field(data, elem_type_pos, et_wire).unwrap_or(elem_type_pos);
+                            }
+                        }
+                        if type_wire == 2 || type_new >= type_end {
+                            break;
+                        }
+                        type_pos = self.skip_field(data, type_pos, type_wire).unwrap_or(type_pos);
+                    }
+                    pos = type_end;
+                }
+                _ => {
+                    pos = self.skip_field(data, pos, wire_type)?;
+                }
+            }
+        }
+
+        if name.is_empty() {
+            return Ok(None);
+        }
+
+        Ok(Some(GraphIO {
+            name: name.clone(),
+            io: crate::ir::NodeIO {
+                tensor_name: name,
+                data_type: dtype,
+            },
+            is_model_input: is_input,
+            is_model_output: !is_input,
+        }))
     }
 
     /// Parse a single node (NodeProto)
