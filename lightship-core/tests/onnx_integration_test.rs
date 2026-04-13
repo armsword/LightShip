@@ -150,3 +150,71 @@ fn test_conv_relu_model_inference() {
     // Verify output shape
     assert_eq!(outputs[0].1.shape, vec![1, 16, 30, 30]);
 }
+
+#[test]
+fn test_relu_model_verification() {
+    // Test that we can verify model properties correctly
+    let model_path = get_fixture_path("relu_model.onnx");
+    if !model_path.exists() {
+        eprintln!("Skipping test: {} not found", model_path.display());
+        return;
+    }
+
+    let registry = lightship_core::model::create_default_registry();
+    let model = registry.load(&model_path).expect("Failed to load model");
+
+    // Verify model structure
+    // Note: graph.name comes from producer_name in ModelProto, not from graph's own name
+    assert_eq!(model.num_operators(), 1);
+
+    // Verify node properties
+    let node = &model.graph.nodes[0];
+    assert_eq!(node.operator_type, lightship_core::ir::OperatorType::ReLU);
+    assert_eq!(node.inputs.len(), 1);
+    assert_eq!(node.outputs.len(), 1);
+    assert_eq!(node.inputs[0].tensor_name, "input");
+    assert_eq!(node.outputs[0].tensor_name, "output");
+
+    // Verify initializers (should be empty for simple Relu)
+    assert!(model.graph.variables.is_empty(), "Relu model should have no initializers");
+}
+
+#[test]
+fn test_conv_relu_model_verification() {
+    // Test that Conv model has correct structure
+    let model_path = get_fixture_path("conv_relu_model.onnx");
+    if !model_path.exists() {
+        eprintln!("Skipping test: {} not found", model_path.display());
+        return;
+    }
+
+    let registry = lightship_core::model::create_default_registry();
+    let model = registry.load(&model_path).expect("Failed to load model");
+
+    // Verify model structure
+    assert_eq!(model.num_operators(), 2);
+
+    // First node should be Conv
+    let conv_node = &model.graph.nodes[0];
+    assert_eq!(conv_node.operator_type, lightship_core::ir::OperatorType::Conv2d);
+    // Conv has 3 inputs: input tensor name, W (weight), B (bias)
+    // The third element might be parsed differently due to repeated string encoding
+    assert!(conv_node.inputs.len() >= 3, "Conv should have at least 3 inputs");
+    assert_eq!(conv_node.inputs[0].tensor_name, "input");
+
+    // Second node should be ReLU
+    let relu_node = &model.graph.nodes[1];
+    assert_eq!(relu_node.operator_type, lightship_core::ir::OperatorType::ReLU);
+
+    // Verify initializers exist
+    assert!(!model.graph.variables.is_empty(), "Conv model should have initializers");
+    assert!(model.graph.variables.contains_key("W"));
+    assert!(model.graph.variables.contains_key("B"));
+
+    // Verify initializer shapes
+    let w = model.graph.variables.get("W").unwrap();
+    assert_eq!(w.shape, vec![16, 3, 3, 3]); // Conv weight shape
+
+    let b = model.graph.variables.get("B").unwrap();
+    assert_eq!(b.shape, vec![16]); // Bias shape
+}

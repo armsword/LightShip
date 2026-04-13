@@ -275,7 +275,7 @@ impl OnnxLoader {
                     };
                     let content_start = new_offset + len_bytes;
                     let content_end = content_start + content_len;
-                    let (node, _) = self.parse_node(data, content_start, node_id)?;
+                    let (node, _) = self.parse_node(data, content_start, content_end, node_id)?;
                     nodes.push(node);
                     offset = content_end;
                     node_id += 1;
@@ -553,14 +553,14 @@ impl OnnxLoader {
     }
 
     /// Parse a single node (NodeProto)
-    fn parse_node(&self, data: &[u8], offset: usize, node_id: u32) -> StdResult<(Node, usize), ModelLoaderError> {
+    fn parse_node(&self, data: &[u8], offset: usize, end: usize, node_id: u32) -> StdResult<(Node, usize), ModelLoaderError> {
         let mut name = format!("node_{}", node_id);
         let mut op_type = String::new();
         let mut inputs = Vec::new();
         let mut outputs = Vec::new();
         let mut current_offset = offset;
 
-        while current_offset < data.len() {
+        while current_offset < end {
             let (field_number, wire_type, new_offset) = match self.read_tag(data, current_offset) {
                 Some(v) => v,
                 None => break,
