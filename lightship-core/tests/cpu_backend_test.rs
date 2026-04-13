@@ -53,7 +53,7 @@ fn test_cpu_backend_compile_operator() {
     let output = Tensor::new("output".into(), vec![1, 3, 224, 224], DataType::F32);
 
     let compiled = backend
-        .compile_operator(&op_def, &[&input], &[&output])
+        .compile_operator(&op_def, None, &[&input], &[&output])
         .unwrap();
 
     assert_eq!(compiled.operator_type, OperatorType::ReLU);
@@ -103,7 +103,7 @@ fn test_cpu_backend_execute_relu() {
     let mut output = Tensor::new("output".into(), vec![4], DataType::F32);
 
     let compiled = backend
-        .compile_operator(&op_def, &[&input], &[&output])
+        .compile_operator(&op_def, None, &[&input], &[&output])
         .unwrap();
 
     let result = backend.execute(&compiled, &[&input], &mut [&mut output]);
@@ -152,7 +152,7 @@ fn test_cpu_backend_execute_add() {
     let mut output = Tensor::new("c".into(), vec![3], DataType::F32);
 
     let compiled = backend
-        .compile_operator(&op_def, &[&input_a, &input_b], &[&output])
+        .compile_operator(&op_def, None, &[&input_a, &input_b], &[&output])
         .unwrap();
 
     let result = backend.execute(&compiled, &[&input_a, &input_b], &mut [&mut output]);
@@ -208,7 +208,7 @@ fn test_cpu_backend_execute_mul() {
     let mut output = Tensor::new("c".into(), vec![3], DataType::F32);
 
     let compiled = backend
-        .compile_operator(&op_def, &[&input_a, &input_b], &[&output])
+        .compile_operator(&op_def, None, &[&input_a, &input_b], &[&output])
         .unwrap();
 
     let result = backend.execute(&compiled, &[&input_a, &input_b], &mut [&mut output]);
@@ -249,7 +249,7 @@ fn test_cpu_backend_execute_sigmoid() {
     let mut output = Tensor::new("output".into(), vec![3], DataType::F32);
 
     let compiled = backend
-        .compile_operator(&op_def, &[&input], &[&output])
+        .compile_operator(&op_def, None, &[&input], &[&output])
         .unwrap();
 
     let result = backend.execute(&compiled, &[&input], &mut [&mut output]);
@@ -294,7 +294,7 @@ fn test_cpu_backend_execute_tanh() {
     let mut output = Tensor::new("output".into(), vec![3], DataType::F32);
 
     let compiled = backend
-        .compile_operator(&op_def, &[&input], &[&output])
+        .compile_operator(&op_def, None, &[&input], &[&output])
         .unwrap();
 
     let result = backend.execute(&compiled, &[&input], &mut [&mut output]);
@@ -338,7 +338,7 @@ fn test_cpu_backend_execute_relu6() {
     let mut output = Tensor::new("output".into(), vec![7], DataType::F32);
 
     let compiled = backend
-        .compile_operator(&op_def, &[&input], &[&output])
+        .compile_operator(&op_def, None, &[&input], &[&output])
         .unwrap();
 
     let result = backend.execute(&compiled, &[&input], &mut [&mut output]);
@@ -380,7 +380,7 @@ fn test_cpu_backend_execute_maxpool2d() {
     let mut output = Tensor::new("output".into(), vec![1, 1, 1, 1], DataType::F32);
 
     let compiled = backend
-        .compile_operator(&op_def, &[&input], &[&output])
+        .compile_operator(&op_def, None, &[&input], &[&output])
         .unwrap();
 
     let result = backend.execute(&compiled, &[&input], &mut [&mut output]);
@@ -422,7 +422,7 @@ fn test_cpu_backend_execute_avgpool2d() {
     let mut output = Tensor::new("output".into(), vec![1, 1, 1, 1], DataType::F32);
 
     let compiled = backend
-        .compile_operator(&op_def, &[&input], &[&output])
+        .compile_operator(&op_def, None, &[&input], &[&output])
         .unwrap();
 
     let result = backend.execute(&compiled, &[&input], &mut [&mut output]);
@@ -466,7 +466,7 @@ fn test_cpu_backend_execute_softmax() {
     let mut output = Tensor::new("output".into(), vec![3], DataType::F32);
 
     let compiled = backend
-        .compile_operator(&op_def, &[&input], &[&output])
+        .compile_operator(&op_def, None, &[&input], &[&output])
         .unwrap();
 
     let result = backend.execute(&compiled, &[&input], &mut [&mut output]);
@@ -526,7 +526,7 @@ fn test_cpu_backend_execute_div() {
     let mut output = Tensor::new("c".into(), vec![3], DataType::F32);
 
     let compiled = backend
-        .compile_operator(&op_def, &[&input_a], &[&output])
+        .compile_operator(&op_def, None, &[&input_a], &[&output])
         .unwrap();
 
     let result = backend.execute(&compiled, &[&input_a, &input_b], &mut [&mut output]);
@@ -580,7 +580,7 @@ fn test_cpu_backend_execute_sub() {
     let mut output = Tensor::new("c".into(), vec![3], DataType::F32);
 
     let compiled = backend
-        .compile_operator(&op_def, &[&input_a], &[&output])
+        .compile_operator(&op_def, None, &[&input_a], &[&output])
         .unwrap();
 
     let result = backend.execute(&compiled, &[&input_a, &input_b], &mut [&mut output]);
@@ -640,7 +640,7 @@ fn test_cpu_backend_execute_matmul() {
     let mut output = Tensor::new("c".into(), vec![2, 2], DataType::F32);
 
     let compiled = backend
-        .compile_operator(&op_def, &[&input_a], &[&output])
+        .compile_operator(&op_def, None, &[&input_a], &[&output])
         .unwrap();
 
     let result = backend.execute(&compiled, &[&input_a, &input_b], &mut [&mut output]);
@@ -685,7 +685,7 @@ fn test_cpu_backend_execute_reshape() {
     let mut output = Tensor::new("output".into(), vec![2, 2], DataType::F32);
 
     let compiled = backend
-        .compile_operator(&op_def, &[&input], &[&output])
+        .compile_operator(&op_def, None, &[&input], &[&output])
         .unwrap();
 
     let result = backend.execute(&compiled, &[&input], &mut [&mut output]);
@@ -732,7 +732,7 @@ fn test_cpu_backend_execute_transpose() {
     let mut output = Tensor::new("output".into(), vec![3, 2], DataType::F32);
 
     let compiled = backend
-        .compile_operator(&op_def, &[&input], &[&output])
+        .compile_operator(&op_def, None, &[&input], &[&output])
         .unwrap();
 
     let result = backend.execute(&compiled, &[&input], &mut [&mut output]);
@@ -786,7 +786,7 @@ fn test_cpu_backend_execute_conv2d() {
     let mut output = Tensor::new("output".into(), vec![1, 1, 2, 2], DataType::F32);
 
     let compiled = backend
-        .compile_operator(&op_def, &[&input, &filter], &[&output])
+        .compile_operator(&op_def, None, &[&input, &filter], &[&output])
         .unwrap();
 
     let result = backend.execute(&compiled, &[&input, &filter], &mut [&mut output]);
@@ -836,7 +836,7 @@ fn test_cpu_backend_execute_batchnorm() {
     let mut output = Tensor::new("output".into(), vec![1, 2, 2, 2], DataType::F32);
 
     let compiled = backend
-        .compile_operator(&op_def, &[&input], &[&output])
+        .compile_operator(&op_def, None, &[&input], &[&output])
         .unwrap();
 
     let result = backend.execute(&compiled, &[&input], &mut [&mut output]);
@@ -900,7 +900,7 @@ fn test_cpu_backend_execute_fullyconnected() {
     let mut output = Tensor::new("output".into(), vec![1, 3], DataType::F32);
 
     let compiled = backend
-        .compile_operator(&op_def, &[&input, &weight], &[&output])
+        .compile_operator(&op_def, None, &[&input, &weight], &[&output])
         .unwrap();
 
     let result = backend.execute(&compiled, &[&input, &weight], &mut [&mut output]);
@@ -974,7 +974,7 @@ fn test_cpu_backend_conv2d_relu_chain() {
     let mut conv_output = Tensor::new("conv_out".into(), vec![1, 1, 3, 3], DataType::F32);
 
     let conv_compiled = backend
-        .compile_operator(&conv_def, &[&input, &filter], &[&conv_output])
+        .compile_operator(&conv_def, None, &[&input, &filter], &[&conv_output])
         .unwrap();
 
     let result = backend.execute(&conv_compiled, &[&input, &filter], &mut [&mut conv_output]);
@@ -998,7 +998,7 @@ fn test_cpu_backend_conv2d_relu_chain() {
     let mut relu_output = Tensor::new("relu_out".into(), vec![1, 1, 3, 3], DataType::F32);
 
     let relu_compiled = backend
-        .compile_operator(&relu_def, &[&conv_output], &[&relu_output])
+        .compile_operator(&relu_def, None, &[&conv_output], &[&relu_output])
         .unwrap();
 
     let result = backend.execute(&relu_compiled, &[&conv_output], &mut [&mut relu_output]);

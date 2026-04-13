@@ -2,7 +2,7 @@
 
 use std::fmt::Debug;
 use crate::common::{BackendType, LightShipError, Result};
-use crate::ir::{OperatorDef, OperatorType, Tensor};
+use crate::ir::{FusionInfo, OperatorDef, OperatorType, Tensor};
 
 /// Backend error code
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,6 +100,8 @@ pub struct CompiledOperator {
     pub backend_data: BackendSpecificData,
     /// Workgroup size for GPU
     pub workgroup_size: Option<(u32, u32, u32)>,
+    /// Fusion information (if this operator is fused with others)
+    pub fusion: Option<FusionInfo>,
 }
 
 /// Backend-specific compiled data
@@ -134,6 +136,7 @@ pub trait Backend: Send + Sync {
     fn compile_operator(
         &self,
         def: &OperatorDef,
+        fusion: Option<&FusionInfo>,
         inputs: &[&Tensor],
         outputs: &[&Tensor],
     ) -> Result<CompiledOperator>;

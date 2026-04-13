@@ -58,7 +58,7 @@ impl GraphExecutor {
             }
 
             // Compile using backend
-            let compiled = self.backend.as_ref().compile_operator(&def, &[], &[])?;
+            let compiled = self.backend.as_ref().compile_operator(&def, node.fusion.as_ref(), &[], &[])?;
             self.compiled_ops.insert(node.name.clone(), compiled);
         }
 

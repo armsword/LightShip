@@ -9,7 +9,7 @@ use crate::operator::{BatchNorm, Conv2d, Conv2dConfig, Pool2d, Pool2dConfig};
 use crate::backend::memory::StorageLocation;
 use crate::common::{BackendType, DataType, LightShipError, Result, StorageLayout};
 use crate::common::error::BackendError;
-use crate::ir::{OperatorDef, OperatorType, Tensor};
+use crate::ir::{FusionInfo, OperatorDef, OperatorType, Tensor};
 use crate::platform::{add_simd, detect_simd_level, div_scalar_simd, div_simd, exp_simd, gemm_simd, horizontal_sum, mul_simd, relu_simd, relu6_simd, sub_simd, tanh_simd, SimdLevel};
 use std::alloc::{alloc, dealloc, Layout};
 use std::ptr::NonNull;
@@ -139,6 +139,7 @@ impl Backend for CpuBackend {
     fn compile_operator(
         &self,
         def: &OperatorDef,
+        fusion: Option<&FusionInfo>,
         _inputs: &[&Tensor],
         _outputs: &[&Tensor],
     ) -> Result<CompiledOperator> {
@@ -146,6 +147,7 @@ impl Backend for CpuBackend {
             operator_type: def.operator_type,
             backend_data: BackendSpecificData::Cpu(Vec::new()),
             workgroup_size: None,
+            fusion: fusion.cloned(),
         })
     }
 

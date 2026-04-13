@@ -31,7 +31,7 @@ fn test_relu_performance_small() {
     let mut output = Tensor::new("output".into(), vec![1024], DataType::F32);
 
     let compiled = backend
-        .compile_operator(&op_def, &[&input], &[&output])
+        .compile_operator(&op_def, None, &[&input], &[&output])
         .unwrap();
 
     let start = Instant::now();
@@ -68,7 +68,7 @@ fn test_relu_performance_large() {
     let mut output = Tensor::new("output".into(), vec![1024 * 1024], DataType::F32);
 
     let compiled = backend
-        .compile_operator(&op_def, &[&input], &[&output])
+        .compile_operator(&op_def, None, &[&input], &[&output])
         .unwrap();
 
     let start = Instant::now();
@@ -120,7 +120,7 @@ fn test_matmul_performance() {
     let mut c = Tensor::new("c".into(), vec![m, n], DataType::F32);
 
     let compiled = backend
-        .compile_operator(&op_def, &[&a, &b], &[&c])
+        .compile_operator(&op_def, None, &[&a, &b], &[&c])
         .unwrap();
 
     let start = Instant::now();
@@ -153,7 +153,7 @@ fn test_softmax_performance() {
     let mut output = Tensor::new("output".into(), vec![1000], DataType::F32);
 
     let compiled = backend
-        .compile_operator(&op_def, &[&input], &[&output])
+        .compile_operator(&op_def, None, &[&input], &[&output])
         .unwrap();
 
     let start = Instant::now();
@@ -212,7 +212,7 @@ fn test_conv2d_performance() {
     let mut output = Tensor::new("output".into(), vec![1, 16, 30, 30], DataType::F32);
 
     let compiled = backend
-        .compile_operator(&op_def, &[&input, &filter], &[&output])
+        .compile_operator(&op_def, None, &[&input, &filter], &[&output])
         .unwrap();
 
     let start = Instant::now();
