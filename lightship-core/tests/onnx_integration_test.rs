@@ -116,13 +116,8 @@ fn test_conv_relu_model_inference() {
     let mut session = SessionHandle::new().unwrap();
     let model = session.load_model(&model_path).unwrap();
 
-    // Check if model has initializers (weights) - if so, we can't run inference yet
-    // because we don't have initializer parsing implemented
-    let has_weights = model.graph.nodes.iter().any(|n| n.inputs.len() > 1);
-    if has_weights {
-        eprintln!("Skipping test: model has weights (initializers) which are not yet supported");
-        return;
-    }
+    // Verify that initializers were parsed
+    assert!(!model.graph.variables.is_empty(), "Model should have initializers (weights)");
 
     // Input shape: [1, 3, 32, 32]
     let input_data: Vec<f32> = (0..1 * 3 * 32 * 32)

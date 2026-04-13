@@ -14,6 +14,7 @@ use std::fmt::Debug;
 use std::io::{Cursor, Read};
 use std::path::Path;
 use std::result::Result as StdResult;
+use std::sync::Arc;
 
 /// ONNX operator type mapping
 mod operators {
@@ -220,9 +221,10 @@ impl OnnxLoader {
                     let graph_end = after_len_offset + graph_len as usize;
 
                     // Parse nodes from graph content
-                    let (nodes, graph_outputs) = self.parse_nodes_from_graph(data, after_len_offset, graph_end)?;
+                    let (nodes, graph_outputs, graph_variables) = self.parse_nodes_from_graph(data, after_len_offset, graph_end)?;
                     graph.nodes = nodes;
                     graph.outputs = graph_outputs;
+                    graph.variables = graph_variables;
 
                     // Move offset past the entire graph field
                     offset = graph_end;
@@ -248,9 +250,11 @@ impl OnnxLoader {
     }
 
     /// Parse nodes from graph body
-    fn parse_nodes_from_graph(&self, data: &[u8], mut offset: usize, end: usize) -> StdResult<(Vec<Node>, Vec<GraphIO>), ModelLoaderError> {
+    /// Returns (nodes, outputs, variables)
+    fn parse_nodes_from_graph(&self, data: &[u8], mut offset: usize, end: usize) -> StdResult<(Vec<Node>, Vec<GraphIO>, std::collections::HashMap<String, Arc<crate::ir::Tensor>>), ModelLoaderError> {
         let mut nodes = Vec::new();
         let mut outputs = Vec::new();
+        let mut variables: std::collections::HashMap<String, Arc<crate::ir::Tensor>> = std::collections::HashMap::new();
         let mut node_id = 0;
 
         // Look for node entries (field 1 in GraphProto per ONNX spec)
@@ -274,6 +278,20 @@ impl OnnxLoader {
                     offset = content_end;
                     node_id += 1;
                 }
+                (5, 2) => {
+                    // initializer (TensorProto) - length-delimited
+                    let (content_len, len_bytes) = {
+                        let (len, pos) = self.read_varint(data, new_offset)?;
+                        (len as usize, pos - new_offset)
+                    };
+                    let content_start = new_offset + len_bytes;
+                    let content_end = content_start + content_len;
+                    if let Some(tensor) = self.parse_tensor_proto(data, content_start, content_end)? {
+                        let name = tensor.name.clone();
+                        variables.insert(name, Arc::new(tensor));
+                    }
+                    offset = content_end;
+                }
                 (11, 2) => {
                     // ValueInfoProto for input - skip for now
                     offset = self.skip_field(data, new_offset, wire_type)?;
@@ -289,7 +307,130 @@ impl OnnxLoader {
             }
         }
 
-        Ok((nodes, outputs))
+        Ok((nodes, outputs, variables))
+    }
+
+    /// Parse TensorProto (initializer)
+    fn parse_tensor_proto(&self, data: &[u8], offset: usize, end: usize) -> StdResult<Option<crate::ir::Tensor>, ModelLoaderError> {
+        let mut name = String::new();
+        let mut dims: Vec<usize> = Vec::new();
+        let mut data_type: i32 = 1;  // Default to F32
+        let mut float_data: Option<Vec<f32>> = None;
+        let mut raw_data: Option<Vec<u8>> = None;
+
+        let mut pos = offset;
+        while pos < end && pos < data.len() {
+            let (field_number, wire_type, new_offset) = match self.read_tag(data, pos) {
+                Some(v) => v,
+                None => break,
+            };
+            pos = new_offset;
+
+            match (field_number, wire_type) {
+                (1, 0) => {
+                    // dims (repeated int64) - each dim is a varint
+                    if let Some((val, new_pos)) = self.read_varint_raw(data, pos) {
+                        dims.push(val as usize);
+                        pos = new_pos;
+                    }
+                }
+                (1, 2) => {
+                    // dims as packed bytes (protobuf 2 packed encoding)
+                    if let Ok((dim_bytes, new_pos)) = self.read_bytes(data, pos) {
+                        // Parse dimensions from raw bytes (packed int64)
+                        let mut byte_pos = 0;
+                        while byte_pos + 8 <= dim_bytes.len() {
+                            let dim = i64::from_le_bytes([
+                                dim_bytes[byte_pos], dim_bytes[byte_pos+1],
+                                dim_bytes[byte_pos+2], dim_bytes[byte_pos+3],
+                                dim_bytes[byte_pos+4], dim_bytes[byte_pos+5],
+                                dim_bytes[byte_pos+6], dim_bytes[byte_pos+7],
+                            ]);
+                            dims.push(dim as usize);
+                            byte_pos += 8;
+                        }
+                        pos = new_pos;
+                    }
+                }
+                (2, 0) => {
+                    // data_type (int)
+                    if let Ok((val, new_pos)) = self.read_varint(data, pos) {
+                        data_type = val as i32;
+                        pos = new_pos;
+                    }
+                }
+                (4, 2) => {
+                    // float_data (repeated float) - length-delimited, packed bytes
+                    if let Ok((float_bytes, new_pos)) = self.read_bytes(data, pos) {
+                        let count = float_bytes.len() / 4;
+                        let mut floats = Vec::with_capacity(count);
+                        for i in 0..count {
+                            let f = f32::from_le_bytes([
+                                float_bytes[i*4], float_bytes[i*4+1],
+                                float_bytes[i*4+2], float_bytes[i*4+3],
+                            ]);
+                            floats.push(f);
+                        }
+                        float_data = Some(floats);
+                        pos = new_pos;
+                    }
+                }
+                (8, 2) => {
+                    // name (string)
+                    if let Ok((str_val, new_pos)) = self.read_string(data, pos) {
+                        name = str_val;
+                        pos = new_pos;
+                    }
+                }
+                (9, 2) => {
+                    // raw_data (bytes)
+                    if let Ok((bytes, new_pos)) = self.read_bytes(data, pos) {
+                        raw_data = Some(bytes);
+                        pos = new_pos;
+                    }
+                }
+                _ => {
+                    pos = self.skip_field(data, pos, wire_type)?;
+                }
+            }
+        }
+
+        if name.is_empty() {
+            return Ok(None);
+        }
+
+        // Convert data to tensor
+        let dtype = match data_type {
+            1 => crate::common::DataType::F32,  // FLOAT
+            7 => crate::common::DataType::I32,  // INT32
+            _ => crate::common::DataType::F32,
+        };
+
+        // Use float_data if available, otherwise use raw_data
+        let tensor_data = if let Some(ref floats) = float_data {
+            let byte_size = floats.len() * 4;
+            let mut bytes = Vec::with_capacity(byte_size);
+            for f in floats {
+                bytes.extend_from_slice(&f.to_le_bytes());
+            }
+            bytes
+        } else if let Some(bytes) = raw_data {
+            bytes
+        } else {
+            return Ok(None);
+        };
+
+        let tensor = crate::ir::Tensor {
+            name: name.clone(),
+            shape: dims,
+            data_type: dtype,
+            layout: crate::common::StorageLayout::Default,
+            data: crate::ir::TensorData::Owned(tensor_data),
+            quantization: None,
+            lifetime: crate::common::TensorLifetime::Static,
+        };
+
+        Ok(Some(tensor))
     }
 
     /// Parse a single node (NodeProto)
@@ -515,6 +656,21 @@ impl OnnxLoader {
         let s = String::from_utf8_lossy(&data[pos..pos + len]).to_string();
         pos += len;
         Ok((s, pos))
+    }
+
+    /// Read raw bytes (for binary data like packed int64s or raw tensor data)
+    fn read_bytes(&self, data: &[u8], offset: usize) -> Result<(Vec<u8>, usize), ModelLoaderError> {
+        let (len, mut pos) = self.read_varint(data, offset)?;
+        let len = len as usize;
+        if pos + len > data.len() {
+            return Err(ModelLoaderError::ParseError {
+                location: format!("offset {}", offset),
+                message: format!("Bytes extend beyond buffer: {} + {}", pos, len),
+            });
+        }
+        let bytes = data[pos..pos + len].to_vec();
+        pos += len;
+        Ok((bytes, pos))
     }
 
     /// Skip a field based on wire type

@@ -96,15 +96,18 @@ impl GraphExecutor {
                 .ok_or_else(|| LightShipError::InvalidParam(format!("Node {} not found", node_id)))?;
 
             // Get or create input tensors
-            // Note: For now, we create placeholder tensors for missing inputs (e.g., weights from initializers)
-            // This is a temporary solution until we properly parse initializers
+            // Check tensor_storage first (runtime data), then graph.variables (static weights)
             let mut input_tensors: Vec<Tensor> = Vec::new();
             for input in &node.inputs {
                 if let Some(tensor) = tensor_storage.get(&input.tensor_name) {
                     input_tensors.push(tensor.clone());
+                } else if let Some(var_tensor) = graph.variables.get(&input.tensor_name) {
+                    // Use variable (initializer/weight) from graph
+                    tracing::debug!("Using initializer {} for node {}", input.tensor_name, node.name);
+                    tracing::debug!("  shape: {:?}, data_len: {}", var_tensor.shape, var_tensor.data_as_bytes().len());
+                    input_tensors.push(var_tensor.as_ref().clone());
                 } else {
-                    // Create a placeholder tensor for missing inputs (e.g., weights)
-                    // This is temporary - proper initializers parsing is needed
+                    // Create a placeholder tensor for missing inputs
                     tracing::warn!("Input tensor {} not found for node {}, using placeholder",
                         input.tensor_name, node.name);
                     let placeholder = Tensor::new(
