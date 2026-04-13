@@ -68,7 +68,7 @@ impl Scheduler {
         // Schedule nodes
         for (order_idx, &node_id) in order.iter().enumerate() {
             if let Some(node) = node_map.get(&node_id) {
-                let mut scheduled = self.schedule_node(node, order_idx, &parallelizable_ops);
+                let scheduled = self.schedule_node(node, order_idx, &parallelizable_ops);
                 plan.add_node(scheduled);
             }
         }
@@ -90,7 +90,7 @@ impl Scheduler {
     fn schedule_node(
         &self,
         node: &Node,
-        order: usize,
+        _order: usize,
         parallelizable: &HashSet<NodeId>,
     ) -> ScheduledNode {
         let mut scheduled = ScheduledNode::new(node.id, node.operator_type.clone());

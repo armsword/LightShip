@@ -213,7 +213,7 @@ pub unsafe extern "C" fn LightShipEngine_Destroy(engine: *mut std::ffi::c_void) 
     // Clean up associated models
     let models_to_remove: Vec<usize> = state.models
         .iter()
-        .filter(|(_, m)| {
+        .filter(|(_, _m)| {
             // Models are not directly associated with engines, but we track them
             false
         })
@@ -357,9 +357,9 @@ pub unsafe extern "C" fn LightShipEngine_CreateSession(
 #[no_mangle]
 pub unsafe extern "C" fn LightShipSession_Run(
     session: *mut std::ffi::c_void,
-    inputs: *const *mut std::ffi::c_void,
+    _inputs: *const *mut std::ffi::c_void,
     num_inputs: u32,
-    outputs: *const *mut std::ffi::c_void,
+    _outputs: *const *mut std::ffi::c_void,
     num_outputs: u32,
 ) -> LightShipErrorCode {
     if session.is_null() {
@@ -591,7 +591,7 @@ pub unsafe extern "C" fn LightShipSession_SetBackend(
 /// This function is unsafe and must be called with valid pointers.
 #[no_mangle]
 pub unsafe extern "C" fn LightShipEngine_GetLastError(
-    engine: *mut std::ffi::c_void,
+    _engine: *mut std::ffi::c_void,
     out_message: *mut *const c_char,
 ) -> LightShipErrorCode {
     if out_message.is_null() {

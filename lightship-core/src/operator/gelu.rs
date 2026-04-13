@@ -116,7 +116,7 @@ impl Gelu {
 
     /// SIMD-accelerated tanh approximation for slices
     /// tanh(x) ≈ x - x^3/3 + x^5/5 - x^7/7 for |x| < 5
-    fn tanh_simd_internal(input: &[f32], output: &mut [f32], len: usize, level: SimdLevel) {
+    fn tanh_simd_internal(input: &[f32], output: &mut [f32], len: usize, _level: SimdLevel) {
         // Constants
         let c0 = 1.0f32;
         let c1_neg = -1.0 / 3.0;

@@ -722,7 +722,7 @@ impl OnnxLoader {
         if offset >= data.len() {
             return None;
         }
-        let (varint, mut new_offset) = self.read_varint_raw(data, offset)?;
+        let (varint, new_offset) = self.read_varint_raw(data, offset)?;
         let field_number = (varint >> 3) as u32;
         let wire_type = (varint & 0x7) as u8;
         Some((field_number, wire_type, new_offset))
@@ -881,7 +881,7 @@ impl ModelLoader for OnnxLoader {
     }
 
     fn validate(&self, model: &ModelFile) -> StdResult<ValidationResult, ModelLoaderError> {
-        let mut errors = Vec::new();
+        let errors = Vec::new();
         let mut warnings = Vec::new();
 
         // Check that graph has inputs

@@ -128,7 +128,7 @@ impl Conv2d {
         for group_idx in 0..config.groups {
             // Build Im2col matrix for this group
             // Col matrix: [out_h * out_w, kernel_h * kernel_w * c_in_per_group]
-            let col_matrix = self.im2col(
+            let _col_matrix = self.im2col(
                 &input_data, n, c_in, in_h, in_w,
                 out_h, out_w, group_idx, c_in_per_group
             );

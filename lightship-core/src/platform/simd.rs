@@ -456,7 +456,7 @@ fn gemm_scalar(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize
     }
 }
 
-fn horizontal_sum_scalar(arr: &[f32], len: usize) -> f32 {
+fn horizontal_sum_scalar(arr: &[f32], _len: usize) -> f32 {
     arr.iter().sum()
 }
 

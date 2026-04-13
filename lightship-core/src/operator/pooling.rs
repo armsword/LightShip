@@ -173,7 +173,7 @@ impl Pool2d {
         let input_data = self.extract_f32_data(input);
         let mut output_data = vec![0.0f32; out_len];
 
-        let kernel_size = config.kernel_h * config.kernel_w;
+        let _kernel_size = config.kernel_h * config.kernel_w;
 
         for n_idx in 0..n {
             for c_idx in 0..c {
@@ -236,7 +236,7 @@ impl Pool2d {
         let input_data = self.extract_f32_data(input);
         let mut output_data = vec![0.0f32; out_len];
 
-        let kernel_size = config.kernel_h * config.kernel_w;
+        let _kernel_size = config.kernel_h * config.kernel_w;
 
         // For small kernels, use SIMD; for complex cases, fall back to scalar
         if config.kernel_h == 2 && config.kernel_w == 2 &&
@@ -262,7 +262,7 @@ impl Pool2d {
                            in_h: usize, in_w: usize,
                            out_h: usize, out_w: usize,
                            output: &mut [f32]) {
-        let mut temp_buf = vec![0.0f32; in_h * in_w.max(4)];
+        let _temp_buf = vec![0.0f32; in_h * in_w.max(4)];
 
         for n_idx in 0..n {
             for c_idx in 0..c {
@@ -321,7 +321,7 @@ impl Pool2d {
         let input_data = self.extract_f32_data(input);
         let mut output_data = vec![0.0f32; out_len];
 
-        let kernel_size = config.kernel_h * config.kernel_w;
+        let _kernel_size = config.kernel_h * config.kernel_w;
 
         for n_idx in 0..n {
             for c_idx in 0..c {

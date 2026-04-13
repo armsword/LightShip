@@ -82,7 +82,7 @@ impl QuantizationParameters {
     }
 
     /// Create new quantization parameters for per-channel
-    pub fn new_per_channel(scales: Vec<f32>, zero_points: Vec<i32>, axis: QuantizationAxis, bit_width: u8) -> Self {
+    pub fn new_per_channel(scales: Vec<f32>, zero_points: Vec<i32>, _axis: QuantizationAxis, bit_width: u8) -> Self {
         let (qmin, qmax) = Self::range_for_bits(bit_width);
         Self {
             scales,

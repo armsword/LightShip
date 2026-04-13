@@ -265,13 +265,13 @@ impl SkipConnection {
     }
 
     /// Add two tensors element-wise
-    fn add_tensors(&self, a: Tensor, b: Tensor) -> Tensor {
+    fn add_tensors(&self, a: Tensor, _b: Tensor) -> Tensor {
         // Placeholder - actual implementation would add tensors
         a
     }
 
     /// Scale a tensor
-    fn scale_tensor(&self, tensor: Tensor, scale: f32) -> Tensor {
+    fn scale_tensor(&self, tensor: Tensor, _scale: f32) -> Tensor {
         // Placeholder - actual implementation would scale
         tensor
     }
