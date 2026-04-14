@@ -9,7 +9,7 @@ use crate::operator::{BatchNorm, Conv2d, Conv2dConfig, Pool2d, Pool2dConfig};
 use crate::backend::memory::StorageLocation;
 use crate::common::{BackendType, DataType, LightShipError, Result, StorageLayout};
 use crate::common::error::BackendError;
-use crate::ir::{FusionInfo, OperatorDef, OperatorType, Tensor};
+use crate::ir::{FusionInfo, FusionType, OperatorDef, OperatorType, Tensor};
 use crate::platform::{add_simd, detect_simd_level, div_scalar_simd, div_simd, exp_simd, gemm_simd, horizontal_sum, mul_simd, relu_simd, relu6_simd, sub_simd, tanh_simd, SimdLevel};
 use std::alloc::{alloc, dealloc, Layout};
 use std::ptr::NonNull;
@@ -157,6 +157,11 @@ impl Backend for CpuBackend {
         inputs: &[&Tensor],
         outputs: &mut [&mut Tensor],
     ) -> Result<()> {
+        // Check if this is a fused operator
+        if let Some(ref fusion) = op.fusion {
+            return self.execute_fused(fusion, inputs, outputs);
+        }
+
         match op.operator_type {
             OperatorType::ReLU => self.execute_relu(inputs, outputs),
             OperatorType::ReLU6 => self.execute_relu6(inputs, outputs),
@@ -227,6 +232,190 @@ impl Backend for CpuBackend {
 }
 
 impl CpuBackend {
+    /// Execute fused operators (e.g., Conv+ReLU, Conv+BatchNorm)
+    fn execute_fused(
+        &self,
+        fusion: &FusionInfo,
+        inputs: &[&Tensor],
+        outputs: &mut [&mut Tensor],
+    ) -> Result<()> {
+        match fusion.fusion_type {
+            FusionType::ConvReLU => self.execute_conv_relu_fused(inputs, outputs),
+            FusionType::ConvReLU6 => self.execute_conv_relu6_fused(inputs, outputs),
+            FusionType::ConvBatchNorm => self.execute_conv_batchnorm_fused(inputs, outputs),
+            FusionType::BatchNormReLU => self.execute_batchnorm_relu_fused(inputs, outputs),
+            _ => {
+                tracing::warn!("Fusion type {:?} not yet implemented", fusion.fusion_type);
+                Ok(())
+            }
+        }
+    }
+
+    /// Fused Conv + ReLU execution
+    fn execute_conv_relu_fused(&self, inputs: &[&Tensor], outputs: &mut [&mut Tensor]) -> Result<()> {
+        if inputs.len() < 2 || outputs.is_empty() {
+            return Err(LightShipError::InvalidParam("Conv+ReLU requires 2 inputs".into()));
+        }
+        let input = inputs[0];
+        let filter = inputs[1];
+        let output = &mut outputs[0];
+
+        let config = Conv2dConfig {
+            out_channels: filter.shape[0],
+            kernel_h: filter.shape[2],
+            kernel_w: filter.shape[3],
+            stride_h: 1,
+            stride_w: 1,
+            pad_h: 0,
+            pad_w: 0,
+            dilation_h: 1,
+            dilation_w: 1,
+            groups: 1,
+        };
+
+        let conv = Conv2d::new(config);
+        let result = conv.forward(input, filter)?;
+
+        // Apply ReLU using SIMD
+        let bytes = result.data_as_bytes();
+        let num_elements = bytes.len() / 4;
+        let input_f32: Vec<f32> = bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+
+        let mut output_f32 = vec![0.0f32; num_elements];
+        let simd_level = detect_simd_level();
+        relu_simd(&input_f32, &mut output_f32, simd_level);
+
+        let mut output_bytes = Vec::with_capacity(bytes.len());
+        for &val in &output_f32 {
+            output_bytes.extend_from_slice(&val.to_le_bytes());
+        }
+        output.data = crate::ir::TensorData::Owned(output_bytes);
+
+        tracing::debug!("CPU Conv+ReLU fused executed");
+        Ok(())
+    }
+
+    /// Fused Conv + ReLU6 execution
+    fn execute_conv_relu6_fused(&self, inputs: &[&Tensor], outputs: &mut [&mut Tensor]) -> Result<()> {
+        if inputs.len() < 2 || outputs.is_empty() {
+            return Err(LightShipError::InvalidParam("Conv+ReLU6 requires 2 inputs".into()));
+        }
+        let input = inputs[0];
+        let filter = inputs[1];
+        let output = &mut outputs[0];
+
+        let config = Conv2dConfig {
+            out_channels: filter.shape[0],
+            kernel_h: filter.shape[2],
+            kernel_w: filter.shape[3],
+            stride_h: 1,
+            stride_w: 1,
+            pad_h: 0,
+            pad_w: 0,
+            dilation_h: 1,
+            dilation_w: 1,
+            groups: 1,
+        };
+
+        let conv = Conv2d::new(config);
+        let result = conv.forward(input, filter)?;
+
+        // Apply ReLU6 using SIMD
+        let bytes = result.data_as_bytes();
+        let num_elements = bytes.len() / 4;
+        let input_f32: Vec<f32> = bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+
+        let mut output_f32 = vec![0.0f32; num_elements];
+        let simd_level = detect_simd_level();
+        relu6_simd(&input_f32, &mut output_f32, simd_level);
+
+        let mut output_bytes = Vec::with_capacity(bytes.len());
+        for &val in &output_f32 {
+            output_bytes.extend_from_slice(&val.to_le_bytes());
+        }
+        output.data = crate::ir::TensorData::Owned(output_bytes);
+
+        tracing::debug!("CPU Conv+ReLU6 fused executed");
+        Ok(())
+    }
+
+    /// Fused Conv + BatchNorm execution
+    fn execute_conv_batchnorm_fused(&self, inputs: &[&Tensor], outputs: &mut [&mut Tensor]) -> Result<()> {
+        if inputs.len() < 2 || outputs.is_empty() {
+            return Err(LightShipError::InvalidParam("Conv+BatchNorm requires 2 inputs".into()));
+        }
+        let input = inputs[0];
+        let filter = inputs[1];
+        let output = &mut outputs[0];
+
+        let out_channels = filter.shape[0];
+        let config = Conv2dConfig {
+            out_channels,
+            kernel_h: filter.shape[2],
+            kernel_w: filter.shape[3],
+            stride_h: 1,
+            stride_w: 1,
+            pad_h: 0,
+            pad_w: 0,
+            dilation_h: 1,
+            dilation_w: 1,
+            groups: 1,
+        };
+
+        let conv = Conv2d::new(config);
+        let conv_result = conv.forward(input, filter)?;
+
+        let bn = BatchNorm::new(out_channels);
+        let result = bn.forward_inference(&conv_result)?;
+        output.data = result.data;
+
+        tracing::debug!("CPU Conv+BatchNorm fused executed");
+        Ok(())
+    }
+
+    /// Fused BatchNorm + ReLU execution
+    fn execute_batchnorm_relu_fused(&self, inputs: &[&Tensor], outputs: &mut [&mut Tensor]) -> Result<()> {
+        if inputs.is_empty() || outputs.is_empty() {
+            return Err(LightShipError::InvalidParam("BatchNorm+ReLU requires 1 input".into()));
+        }
+        let input = inputs[0];
+        let output = &mut outputs[0];
+
+        let num_features = if input.shape.len() >= 2 { input.shape[1] } else {
+            return Err(LightShipError::InvalidParam("BatchNorm requires at least 2D input".into()));
+        };
+
+        let bn = BatchNorm::new(num_features);
+        let bn_result = bn.forward_inference(input)?;
+
+        // Apply ReLU using SIMD
+        let bytes = bn_result.data_as_bytes();
+        let num_elements = bytes.len() / 4;
+        let input_f32: Vec<f32> = bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+
+        let mut output_f32 = vec![0.0f32; num_elements];
+        let simd_level = detect_simd_level();
+        relu_simd(&input_f32, &mut output_f32, simd_level);
+
+        let mut output_bytes = Vec::with_capacity(bytes.len());
+        for &val in &output_f32 {
+            output_bytes.extend_from_slice(&val.to_le_bytes());
+        }
+        output.data = crate::ir::TensorData::Owned(output_bytes);
+
+        tracing::debug!("CPU BatchNorm+ReLU fused executed");
+        Ok(())
+    }
+
     fn execute_relu(&self, inputs: &[&Tensor], outputs: &mut [&mut Tensor]) -> Result<()> {
         if inputs.is_empty() || outputs.is_empty() {
             return Err(LightShipError::InvalidParam("Missing input or output".into()));

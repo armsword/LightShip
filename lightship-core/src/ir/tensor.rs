@@ -101,6 +101,15 @@ impl Tensor {
         }
     }
 
+    /// Get mutable tensor data as byte slice
+    pub fn data_as_bytes_mut(&mut self) -> &mut [u8] {
+        match &mut self.data {
+            TensorData::Empty => &mut [],
+            TensorData::Owned(v) => v,
+            TensorData::Shared(v) => Arc::make_mut(v).as_mut_slice(),
+        }
+    }
+
     /// Create tensor with owned data
     pub fn from_data(name: String, shape: TensorShape, data_type: DataType, data: Vec<f32>) -> Self {
         let byte_size = data.len() * 4;
