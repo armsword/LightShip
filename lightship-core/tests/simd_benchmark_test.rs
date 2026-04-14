@@ -222,3 +222,44 @@ fn test_conv2d_performance() {
     println!("Conv2d (1x3x32x32 @ 16x3x3x3): {:?}", elapsed);
     assert_eq!(output.shape, vec![1, 16, 30, 30]);
 }
+
+#[test]
+fn test_conv2d_batch4_performance() {
+    // Benchmark Conv2d with batch=4 to test multi-threaded batch parallel
+    let backend = CpuBackend::new();
+
+    let mut op_def = OperatorDef::new("conv".into(), OperatorType::Conv2d);
+    op_def.inputs.push(NodeIO {
+        tensor_name: "input".into(),
+        data_type: DataType::F32,
+    });
+    op_def.inputs.push(NodeIO {
+        tensor_name: "filter".into(),
+        data_type: DataType::F32,
+    });
+    op_def.outputs.push(NodeIO {
+        tensor_name: "output".into(),
+        data_type: DataType::F32,
+    });
+
+    // Input: [4, 3, 32, 32] (batch of 4)
+    let input_data: Vec<f32> = (0..4 * 3 * 32 * 32).map(|i| (i as f32) * 0.01).collect();
+    let input = Tensor::from_data("input".into(), vec![4, 3, 32, 32], DataType::F32, input_data);
+
+    // Filter: [16, 3, 3, 3]
+    let filter_data: Vec<f32> = (0..16 * 3 * 3 * 3).map(|_i| 0.1).collect();
+    let filter = Tensor::from_data("filter".into(), vec![16, 3, 3, 3], DataType::F32, filter_data);
+
+    let mut output = Tensor::new("output".into(), vec![4, 16, 30, 30], DataType::F32);
+
+    let compiled = backend
+        .compile_operator(&op_def, None, &[&input, &filter], &[&output])
+        .unwrap();
+
+    let start = Instant::now();
+    backend.execute(&compiled, &[&input, &filter], &mut [&mut output]).unwrap();
+    let elapsed = start.elapsed();
+
+    println!("Conv2d (batch=4, 4x3x32x32 @ 16x3x3x3): {:?}", elapsed);
+    assert_eq!(output.shape, vec![4, 16, 30, 30]);
+}
