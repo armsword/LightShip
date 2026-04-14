@@ -3,9 +3,10 @@
 //! This module provides an optimized Conv2d implementation using the Im2col
 //! (image to column) transformation followed by GEMM (matrix multiply).
 
-use crate::common::{DataType, Result, StorageLayout};
+use crate::common::{DataType, Result};
 use crate::ir::Tensor;
 use crate::platform::{detect_simd_level, gemm_simd, SimdLevel};
+use std::sync::Arc;
 
 /// Conv2d operator configuration
 #[derive(Debug, Clone)]
@@ -82,7 +83,7 @@ impl Conv2d {
         &self.config
     }
 
-    /// Forward pass: compute convolution
+    /// Forward pass: compute convolution (multi-threaded over batch dimension)
     /// Input: [N, C_in, H, W]
     /// Filter: [out_channels, C_in, kernel_h, kernel_w]
     /// Output: [N, out_channels, out_h, out_w]
@@ -101,113 +102,51 @@ impl Conv2d {
         let in_h = in_shape[2];
         let in_w = in_shape[3];
 
-        // Validate groups
         if c_in % config.groups != 0 || config.out_channels % config.groups != 0 {
             return Err(crate::common::LightShipError::InvalidParam(
                 "Invalid group configuration".into(),
             ));
         }
 
-        // Calculate output shape
         let (out_h, out_w) = config.output_shape(in_shape);
+        let batch_out_size = config.out_channels * out_h * out_w;
 
-        // Initialize output
-        let out_len = n * config.out_channels * out_h * out_w;
-        let mut output_data = vec![0.0f32; out_len];
-
-        // Get dimensions
-        let c_out_per_group = config.out_channels / config.groups;
-        let c_in_per_group = c_in / config.groups;
-        let kernel_size = config.kernel_h * config.kernel_w * c_in_per_group;
-
-        // Extract f32 data
-        let input_data = self.extract_f32_data(input);
+        let input_data = Arc::new(self.extract_f32_data(input));
         let filter_data = self.extract_f32_data(filter);
 
-        // Process each group
-        for group_idx in 0..config.groups {
-            // Build Im2col matrix for this group
-            // Col matrix: [out_h * out_w, kernel_h * kernel_w * c_in_per_group]
-            let _col_matrix = self.im2col(
-                &input_data, n, c_in, in_h, in_w,
-                out_h, out_w, group_idx, c_in_per_group
-            );
+        let c_out_per_group = config.out_channels / config.groups;
+        let c_in_per_group = c_in / config.groups;
 
-            // Filter matrix for this group: [c_out_per_group, kernel_size]
-            // Reshape filter from [out_channels, c_in, kh, kw] to [c_out_per_group, kernel_size]
-            let filter_matrix = self.reshape_filter(
-                &filter_data,
-                group_idx, c_out_per_group, c_in_per_group
-            );
+        // Pre-compute filter matrices for each group (shared across all batch elements)
+        let filter_matrices: Arc<Vec<Vec<f32>>> = Arc::new(
+            (0..config.groups)
+                .map(|g| self.reshape_filter(&filter_data, g, c_out_per_group, c_in_per_group))
+                .collect()
+        );
 
-            // For each batch element, compute GEMM: output_slice = filter_matrix @ col_matrix.T
-            // But since we have multiple output channels, we do:
-            // [c_out_per_group, out_h*out_w] = [c_out_per_group, kernel_size] @ [kernel_size, out_h*out_w]
-            for n_idx in 0..n {
-                // Extract column slice for this batch element
-                // Col is organized as: [n_idx][oh][ow][kh][kw][c] -> linearized
-                // We want: [kh*kw*c_in_per_group][out_h*out_w]
-                let mut col_slice = vec![0.0f32; kernel_size * out_h * out_w];
-                for oh in 0..out_h {
-                    for ow in 0..out_w {
-                        for kh in 0..config.kernel_h {
-                            for kw in 0..config.kernel_w {
-                                for c in 0..c_in_per_group {
-                                    let col_idx = oh * out_w * kernel_size + ow * kernel_size +
-                                        kh * config.kernel_w * c_in_per_group +
-                                        kw * c_in_per_group + c;
-                                    // Input access index
-                                    let in_h_pos = oh * config.stride_h + kh * config.dilation_h;
-                                    let in_w_pos = ow * config.stride_w + kw * config.dilation_w;
-                                    let in_c = group_idx * c_in_per_group + c;
-                                    let in_idx = n_idx * c_in * in_h * in_w +
-                                        in_c * in_h * in_w +
-                                        in_h_pos * in_w +
-                                        in_w_pos;
-                                    let valid = in_h_pos < in_h && in_w_pos < in_w;
-                                    col_slice[col_idx] = if valid { input_data[in_idx] } else { 0.0 };
-                                }
-                            }
-                        }
-                    }
-                }
+        let mut output_data = vec![0.0f32; n * batch_out_size];
 
-                // Transpose col_slice: from [out_h*out_w][kernel_size] to [kernel_size][out_h*out_w]
-                let mut col_transposed = vec![0.0f32; kernel_size * out_h * out_w];
-                for i in 0..kernel_size {
-                    for j in 0..out_h * out_w {
-                        col_transposed[i * out_h * out_w + j] = col_slice[j * kernel_size + i];
-                    }
-                }
+        // Split output buffer into per-batch chunks; each thread writes exclusively to its chunk
+        let chunks: Vec<&mut [f32]> = output_data.chunks_mut(batch_out_size).collect();
 
-                // GEMM: output[n_idx] = filter_matrix @ col_transposed
-                // output: [c_out_per_group, out_h*out_w]
-                let mut output_slice = vec![0.0f32; c_out_per_group * out_h * out_w];
-                gemm_simd(
-                    &filter_matrix,
-                    &col_transposed,
-                    &mut output_slice,
-                    c_out_per_group, // M
-                    out_h * out_w,    // N
-                    kernel_size,      // K
-                    self.simd_level,
-                );
+        std::thread::scope(|s| {
+            for (n_idx, batch_out) in chunks.into_iter().enumerate() {
+                let input_data = Arc::clone(&input_data);
+                let filter_matrices = Arc::clone(&filter_matrices);
+                let simd_level = self.simd_level;
 
-                // Copy to output tensor (NCHW format)
-                for out_c in 0..c_out_per_group {
-                    let global_out_c = group_idx * c_out_per_group + out_c;
-                    for oh in 0..out_h {
-                        for ow in 0..out_w {
-                            let out_idx = n_idx * config.out_channels * out_h * out_w +
-                                global_out_c * out_h * out_w +
-                                oh * out_w + ow;
-                            let gemm_idx = out_c * out_h * out_w + oh * out_w + ow;
-                            output_data[out_idx] = output_slice[gemm_idx];
-                        }
-                    }
-                }
+                s.spawn(move || {
+                    Self::compute_batch_element(
+                        n_idx, batch_out,
+                        &input_data, &filter_matrices,
+                        c_in, in_h, in_w, out_h, out_w,
+                        c_in_per_group, c_out_per_group,
+                        config,
+                        simd_level,
+                    );
+                });
             }
-        }
+        });
 
         Ok(Tensor::new(
             "conv_output".to_string(),
@@ -216,45 +155,88 @@ impl Conv2d {
         ).with_data(output_data))
     }
 
-    /// Im2col transformation: convert input to column matrix
-    fn im2col(&self, input_data: &[f32], n: usize, c_in: usize, in_h: usize, in_w: usize,
-               out_h: usize, out_w: usize, group_idx: usize, c_in_per_group: usize) -> Vec<f32> {
-        let config = &self.config;
+    /// Compute convolution for a single batch element.
+    /// Writes NCHW-format results into `batch_out` (size: out_channels * out_h * out_w).
+    #[allow(clippy::too_many_arguments)]
+    fn compute_batch_element(
+        n_idx: usize,
+        batch_out: &mut [f32],
+        input_data: &[f32],
+        filter_matrices: &[Vec<f32>],
+        c_in: usize, in_h: usize, in_w: usize,
+        out_h: usize, out_w: usize,
+        c_in_per_group: usize, c_out_per_group: usize,
+        config: &Conv2dConfig,
+        simd_level: SimdLevel,
+    ) {
         let kernel_size = config.kernel_h * config.kernel_w * c_in_per_group;
-        let col_size = n * out_h * out_w * kernel_size;
-        let mut col = Vec::with_capacity(col_size);
 
-        // For each batch element
-        for n_idx in 0..n {
-            // For each output position
+        for group_idx in 0..config.groups {
+            let filter_matrix = &filter_matrices[group_idx];
+
+            // Build im2col matrix: [kernel_size, out_h*out_w]
+            // Layout: for each (oh, ow): append the flattened kernel window
+            let mut col = vec![0.0f32; kernel_size * out_h * out_w];
             for oh in 0..out_h {
                 for ow in 0..out_w {
-                    // Kernel sliding window
+                    let col_base = (oh * out_w + ow) * kernel_size;
+                    let mut ki = 0;
                     for kh in 0..config.kernel_h {
                         for kw in 0..config.kernel_w {
                             for c in 0..c_in_per_group {
-                                let in_h_pos = oh * config.stride_h + kh * config.dilation_h - config.pad_h;
-                                let in_w_pos = ow * config.stride_w + kw * config.dilation_w - config.pad_w;
+                                // Compute padded input coordinates
+                                let in_h_idx = (oh * config.stride_h + kh * config.dilation_h)
+                                    .wrapping_sub(config.pad_h);
+                                let in_w_idx = (ow * config.stride_w + kw * config.dilation_w)
+                                    .wrapping_sub(config.pad_w);
                                 let in_c = group_idx * c_in_per_group + c;
-
-                                let value = if in_h_pos < in_h && in_w_pos < in_w && in_h_pos >= 0 && in_w_pos >= 0 {
-                                    let in_idx = n_idx * c_in * in_h * in_w +
-                                        in_c * in_h * in_w +
-                                        in_h_pos * in_w +
-                                        in_w_pos;
-                                    input_data[in_idx]
+                                let valid = in_h_idx < in_h && in_w_idx < in_w;
+                                col[col_base + ki] = if valid {
+                                    input_data[n_idx * c_in * in_h * in_w
+                                        + in_c * in_h * in_w
+                                        + in_h_idx * in_w
+                                        + in_w_idx]
                                 } else {
                                     0.0
                                 };
-                                col.push(value);
+                                ki += 1;
                             }
                         }
                     }
                 }
             }
-        }
 
-        col
+            // Transpose col: [out_h*out_w, kernel_size] → [kernel_size, out_h*out_w]
+            let out_pixels = out_h * out_w;
+            let mut col_t = vec![0.0f32; kernel_size * out_pixels];
+            for i in 0..kernel_size {
+                for j in 0..out_pixels {
+                    col_t[i * out_pixels + j] = col[j * kernel_size + i];
+                }
+            }
+
+            // GEMM: [c_out_per_group, out_pixels] = filter_matrix [c_out_per_group, kernel_size]
+            //                                        @ col_t [kernel_size, out_pixels]
+            let mut out_slice = vec![0.0f32; c_out_per_group * out_pixels];
+            gemm_simd(
+                filter_matrix,
+                &col_t,
+                &mut out_slice,
+                c_out_per_group,
+                out_pixels,
+                kernel_size,
+                simd_level,
+            );
+
+            // Scatter into batch_out (NCHW layout within the batch chunk)
+            for out_c in 0..c_out_per_group {
+                let global_out_c = group_idx * c_out_per_group + out_c;
+                let dst_base = global_out_c * out_pixels;
+                let src_base = out_c * out_pixels;
+                batch_out[dst_base..dst_base + out_pixels]
+                    .copy_from_slice(&out_slice[src_base..src_base + out_pixels]);
+            }
+        }
     }
 
     /// Reshape filter for grouped convolution
@@ -473,5 +455,55 @@ mod tests {
         let output = conv.forward(&input, &filter).unwrap();
 
         assert_eq!(output.shape, vec![1, 4, 2, 2]);
+    }
+
+    #[test]
+    fn test_conv2d_batch_parallel() {
+        // Test batch_size=4 to verify multi-threaded correctness
+        let config = Conv2dConfig {
+            out_channels: 1,
+            kernel_h: 3,
+            kernel_w: 3,
+            stride_h: 1,
+            stride_w: 1,
+            pad_h: 0,
+            pad_w: 0,
+            dilation_h: 1,
+            dilation_w: 1,
+            groups: 1,
+        };
+
+        let conv = Conv2d::new(config);
+
+        // Input: 4x1x4x4 (batch of 4)
+        let mut input_data = Vec::new();
+        for _ in 0..4 {
+            input_data.extend_from_slice(&[1.0f32; 16]); // all-ones 4x4 frame
+        }
+        let input = Tensor::new(
+            "input".to_string(),
+            vec![4, 1, 4, 4],
+            DataType::F32,
+        ).with_data(input_data);
+
+        // Filter: 1x1x3x3, all ones
+        let filter = Tensor::new(
+            "filter".to_string(),
+            vec![1, 1, 3, 3],
+            DataType::F32,
+        ).with_data(vec![1.0; 9]);
+
+        let output = conv.forward(&input, &filter).unwrap();
+
+        // Each batch's output shape: 1x2x2, value 9.0
+        assert_eq!(output.shape, vec![4, 1, 2, 2]);
+        let out_bytes = output.data_as_bytes();
+        let out_data: Vec<f32> = out_bytes.chunks(4).map(|c| {
+            f32::from_le_bytes([c[0], c[1], c[2], c[3]])
+        }).collect();
+        assert_eq!(out_data.len(), 16);
+        for &val in &out_data {
+            assert!((val - 9.0).abs() < 1e-5, "expected 9.0 but got {}", val);
+        }
     }
 }
