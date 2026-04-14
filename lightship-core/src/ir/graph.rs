@@ -208,8 +208,8 @@ impl Graph {
         result
     }
 
-    /// Find the producer node for a tensor
-    fn find_tensor_producer(&self, tensor_name: &str) -> Option<NodeId> {
+    /// Find the producer node for a tensor (pub(crate) for use in executor)
+    pub(crate) fn find_tensor_producer(&self, tensor_name: &str) -> Option<NodeId> {
         self.nodes
             .iter()
             .find(|n| n.outputs.iter().any(|o| &o.tensor_name == tensor_name))

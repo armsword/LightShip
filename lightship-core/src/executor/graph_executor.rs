@@ -3,13 +3,12 @@
 //! This module provides end-to-end model execution using the backend.
 
 use std::fmt::Debug;
-use std::ops::Deref;
+use std::collections::HashMap;
 use std::sync::Arc;
-use crate::backend::Backend;
+use crate::backend::{Backend, CpuBackend};
 use crate::backend::CompiledOperator;
 use crate::common::{LightShipError, Result};
-use crate::ir::{Graph, OperatorDef, OperatorType, Tensor};
-use std::collections::HashMap;
+use crate::ir::{Graph, NodeId, OperatorDef, OperatorType, Tensor};
 
 /// Graph executor for running inference
 pub struct GraphExecutor {
@@ -189,6 +188,182 @@ impl GraphExecutor {
         tracing::debug!("Graph execution completed");
         Ok(())
     }
+
+    /// Compute topological levels for parallel execution.
+    /// Returns nodes grouped by level where all nodes in a level are independent.
+    fn compute_levels(&self, graph: &Graph) -> Vec<Vec<NodeId>> {
+        let n = graph.nodes.len();
+        if n == 0 {
+            return Vec::new();
+        }
+
+        // in_degree[node_id] = number of unresolved input dependencies
+        let mut in_degree = vec![0u32; n];
+        // adjacency[producer] = list of nodes that depend on producer
+        let mut adjacency: std::collections::HashMap<NodeId, Vec<NodeId>> =
+            std::collections::HashMap::new();
+
+        for node in &graph.nodes {
+            for input in &node.inputs {
+                if let Some(producer_id) = graph.find_tensor_producer(&input.tensor_name) {
+                    adjacency.entry(producer_id).or_default().push(node.id);
+                    in_degree[node.id as usize] += 1;
+                }
+            }
+        }
+
+        let mut levels: Vec<Vec<NodeId>> = Vec::new();
+        let mut current: Vec<NodeId> = (0..n as NodeId)
+            .filter(|&id| in_degree[id as usize] == 0)
+            .collect();
+
+        while !current.is_empty() {
+            levels.push(current.clone());
+            let mut next = Vec::new();
+            for &node_id in &current {
+                if let Some(deps) = adjacency.get(&node_id) {
+                    for &dep in deps {
+                        in_degree[dep as usize] -= 1;
+                        if in_degree[dep as usize] == 0 {
+                            next.push(dep);
+                        }
+                    }
+                }
+            }
+            current = next;
+        }
+
+        levels
+    }
+
+    /// Execute the graph with parallel execution of independent nodes (level-by-level).
+    pub fn execute_parallel(
+        &self,
+        graph: &Graph,
+        inputs: &[(&str, Tensor)],
+        outputs: &mut [(&str, Tensor)],
+    ) -> Result<()> {
+        let mut tensor_storage: std::collections::HashMap<String, Arc<Tensor>> =
+            std::collections::HashMap::new();
+
+        let output_names: Vec<String> = outputs.iter().map(|(n, _)| n.to_string()).collect();
+        let output_indices: std::collections::HashMap<&str, usize> = output_names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.as_str(), i))
+            .collect();
+
+        for (name, tensor) in inputs {
+            tensor_storage.insert(name.to_string(), Arc::new(tensor.clone()));
+        }
+
+        // Get topological levels (nodes at same level are independent)
+        let levels = self.compute_levels(graph);
+
+        for level in &levels {
+            // Collect inputs for all nodes in this level upfront
+            let level_inputs: Vec<_> = level
+                .iter()
+                .map(|&node_id| {
+                    let node = graph.nodes.get(node_id as usize).unwrap();
+                    let node_inputs: Vec<Arc<Tensor>> = node
+                        .inputs
+                        .iter()
+                        .map(|input| {
+                            if let Some(t) = tensor_storage.get(&input.tensor_name) {
+                                Arc::clone(t)
+                            } else if let Some(v) = graph.variables.get(&input.tensor_name) {
+                                Arc::clone(v)
+                            } else {
+                                Arc::new(Tensor::new(
+                                    input.tensor_name.clone(),
+                                    vec![1],
+                                    input.data_type,
+                                ))
+                            }
+                        })
+                        .collect();
+                    (node_id, node_inputs)
+                })
+                .collect();
+
+            // Execute all nodes in this level in parallel using scoped threads
+            type NodeResult = Result<Vec<(String, Arc<Tensor>)>>;
+            let mut results: Vec<NodeResult> = Vec::with_capacity(level.len());
+
+            std::thread::scope(|s| {
+                let mut handles: Vec<_> = level_inputs
+                    .iter()
+                    .map(|&(node_id, ref node_inputs)| {
+                        let node = graph.nodes.get(node_id as usize).unwrap();
+                        let compiled = self
+                            .compiled_ops
+                            .get(&node.name)
+                            .unwrap_or_else(|| {
+                                panic!("Compiled operator {} not found", node.name)
+                            });
+
+                        s.spawn(move || {
+                            execute_node_single(
+                                node,
+                                compiled,
+                                node_inputs.iter().map(|t| t.as_ref()).collect::<Vec<_>>(),
+                            )
+                        })
+                    })
+                    .collect();
+
+                // Wait for all threads and collect results
+                for handle in handles.drain(..) {
+                    results.push(handle.join().unwrap());
+                }
+            });
+
+            // Merge results into tensor_storage
+            for node_results in results {
+                let node_outputs = node_results?;
+                for (tensor_name, tensor_arc) in node_outputs {
+                    if output_indices.contains_key(tensor_name.as_str()) {
+                        let idx = *output_indices.get(tensor_name.as_str()).unwrap();
+                        outputs[idx].1.data = tensor_arc.data.clone();
+                    }
+                    tensor_storage.insert(tensor_name, tensor_arc);
+                }
+            }
+        }
+
+        tracing::debug!("Parallel graph execution completed");
+        Ok(())
+    }
+}
+
+/// Execute a single node (used by parallel executor).
+/// Returns output tensor name -> tensor pairs.
+fn execute_node_single(
+    node: &crate::ir::Node,
+    compiled: &crate::backend::CompiledOperator,
+    inputs: Vec<&crate::ir::Tensor>,
+) -> Result<Vec<(String, Arc<Tensor>)>> {
+    let backend: Arc<dyn Backend + Send + Sync> = Arc::new(CpuBackend::new());
+
+    let mut output_tensors: Vec<Tensor> = node
+        .outputs
+        .iter()
+        .map(|o| {
+            let mut t = Tensor::new(o.tensor_name.clone(), vec![1], o.data_type);
+            t.layout = crate::common::StorageLayout::Default;
+            t
+        })
+        .collect();
+
+    let mut output_refs: Vec<&mut Tensor> = output_tensors.iter_mut().collect();
+
+    backend.execute(compiled, &inputs, &mut output_refs)?;
+
+    Ok(output_tensors
+        .into_iter()
+        .map(|t| (t.name.clone(), Arc::new(t)))
+        .collect())
 }
 
 #[cfg(test)]
@@ -259,6 +434,63 @@ mod tests {
         assert_eq!(output_data[3], 2.0);  // max(2, 0)
         assert_eq!(output_data[4], 0.0);  // max(-5, 0)
         assert_eq!(output_data[5], 3.0);  // max(3, 0)
+    }
+
+    #[test]
+    fn test_graph_executor_parallel_level() {
+        // Graph: input1 → ReLU1, input2 → ReLU2 (both in same level, no dependency)
+        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(CpuBackend::new());
+        let mut executor = GraphExecutor::new(Arc::clone(&backend));
+
+        let mut graph = Graph::new("parallel_relu".to_string());
+
+        // Node 0: ReLU1 (takes input1)
+        let mut node0 = Node::new(0, "relu1".to_string(), OperatorType::ReLU);
+        node0.inputs.push(NodeIO {
+            tensor_name: "input1".to_string(),
+            data_type: DataType::F32,
+        });
+        node0.outputs.push(NodeIO {
+            tensor_name: "output1".to_string(),
+            data_type: DataType::F32,
+        });
+        graph.add_node(node0);
+
+        // Node 1: ReLU2 (takes input2, independent from node0)
+        let mut node1 = Node::new(1, "relu2".to_string(), OperatorType::ReLU);
+        node1.inputs.push(NodeIO {
+            tensor_name: "input2".to_string(),
+            data_type: DataType::F32,
+        });
+        node1.outputs.push(NodeIO {
+            tensor_name: "output2".to_string(),
+            data_type: DataType::F32,
+        });
+        graph.add_node(node1);
+
+        executor.prepare(&graph).unwrap();
+
+        let input1 = Tensor::from_data("input1".to_string(), vec![4], DataType::F32, vec![-1.0, 2.0, -3.0, 4.0]);
+        let input2 = Tensor::from_data("input2".to_string(), vec![4], DataType::F32, vec![5.0, -6.0, 7.0, -8.0]);
+
+        let mut outputs_arr = [
+            ("output1", Tensor::new("output1".to_string(), vec![4], DataType::F32)),
+            ("output2", Tensor::new("output2".to_string(), vec![4], DataType::F32)),
+        ];
+
+        executor.execute_parallel(
+            &graph,
+            &[("input1", input1), ("input2", input2)],
+            &mut outputs_arr,
+        ).unwrap();
+
+        let o1_bytes = outputs_arr[0].1.data_as_bytes();
+        let o1: Vec<f32> = o1_bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+        let o2_bytes = outputs_arr[1].1.data_as_bytes();
+        let o2: Vec<f32> = o2_bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+
+        assert_eq!(o1, vec![0.0, 2.0, 0.0, 4.0]);
+        assert_eq!(o2, vec![5.0, 0.0, 7.0, 0.0]);
     }
 
     #[test]
