@@ -10,7 +10,7 @@ use crate::backend::memory::StorageLocation;
 use crate::common::{BackendType, DataType, LightShipError, Result, StorageLayout};
 use crate::common::error::BackendError;
 use crate::ir::{FusionInfo, FusionType, OperatorDef, OperatorType, Tensor};
-use crate::platform::{add_simd, detect_simd_level, div_scalar_simd, div_simd, exp_simd, gemm_simd, horizontal_sum, mul_simd, relu_simd, relu6_simd, relu_simd_bytes, sub_simd, tanh_simd, SimdLevel};
+use crate::platform::{add_simd, detect_simd_level, div_scalar_simd, div_simd, exp_simd, exp_softmax_simd, gemm_simd, horizontal_sum, mul_simd, relu_simd, relu6_simd, relu_simd_bytes, sub_simd, tanh_simd, SimdLevel};
 use std::alloc::{alloc, dealloc, Layout};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -797,9 +797,9 @@ impl CpuBackend {
             *v = *v - max_val;
         }
 
-        // Compute exp(values - max) using SIMD
+        // Compute exp(values - max) using SIMD (softmax-optimized)
         let mut exp_values = vec![0.0f32; num_elements];
-        exp_simd(&values, &mut exp_values, simd_level);
+        exp_softmax_simd(&values, &mut exp_values, simd_level);
 
         // Sum all exp values using SIMD horizontal sum
         let sum_exp = horizontal_sum(&exp_values, simd_level);
