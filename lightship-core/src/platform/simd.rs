@@ -960,9 +960,54 @@ mod x86_64_impls {
         result
     }
 
-    // GEMM implementations (simplified)
+    // GEMM implementations with cache-blocking for better performance
     #[target_feature(enable = "avx512f")]
     pub(super) unsafe fn gemm_avx512(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize) {
+        use std::arch::x86_64::*;
+        let nr = 16;
+
+        // For small matrices, use the simple version to avoid overhead
+        if m * n < 1024 {
+            gemm_avx512_simple(a, b, c, m, n, k);
+            return;
+        }
+
+        // Cache-blocking: block over m and k to improve cache hits
+        let mc = 64.min(m);
+        let kc = 128.min(k);
+
+        for m_block in (0..m).step_by(mc) {
+            let m_end = (m_block + mc).min(m);
+            for k_block in (0..k).step_by(kc) {
+                let k_end = (k_block + kc).min(k);
+
+                for i in m_block..m_end {
+                    for j in (0..n).step_by(nr) {
+                        let j_end = (j + nr).min(n);
+                        let mut sum = [_mm512_setzero_ps(); 16];
+
+                        for p in k_block..k_end {
+                            let a_val = _mm512_set1_ps(a[i * k + p]);
+                            for jj in 0..16 {
+                                let b_idx = p * n + j + jj;
+                                let b_val = _mm512_set1_ps(*b.get_unchecked(b_idx));
+                                sum[jj] = _mm512_fmadd_ps(a_val, b_val, sum[jj]);
+                            }
+                        }
+
+                        for jj in 0..(j_end - j) {
+                            let result = _mm512_reduce_add_ps(sum[jj]);
+                            let c_idx = i * n + j + jj;
+                            *c.get_unchecked_mut(c_idx) += result;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[target_feature(enable = "avx512f")]
+    unsafe fn gemm_avx512_simple(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize) {
         use std::arch::x86_64::*;
         let nr = 16;
         for m_idx in 0..m {
@@ -990,6 +1035,51 @@ mod x86_64_impls {
     pub(super) unsafe fn gemm_avx2(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize) {
         use std::arch::x86_64::*;
         let nr = 8;
+
+        if m * n < 1024 {
+            gemm_avx2_simple(a, b, c, m, n, k);
+            return;
+        }
+
+        let mc = 64.min(m);
+        let kc = 128.min(k);
+
+        for m_block in (0..m).step_by(mc) {
+            let m_end = (m_block + mc).min(m);
+            for k_block in (0..k).step_by(kc) {
+                let k_end = (k_block + kc).min(k);
+
+                for i in m_block..m_end {
+                    for j in (0..n).step_by(nr) {
+                        let j_end = (j + nr).min(n);
+                        let mut sum = [_mm256_setzero256(); 8];
+
+                        for p in k_block..k_end {
+                            let a_val = _mm256_set1_ps(a[i * k + p]);
+                            for jj in 0..8 {
+                                let b_idx = p * n + j + jj;
+                                let b_val = _mm256_set1_ps(*b.get_unchecked(b_idx));
+                                sum[jj] = _mm256_fmadd_ps(a_val, b_val, sum[jj]);
+                            }
+                        }
+
+                        for jj in 0..(j_end - j) {
+                            let temp = _mm256_hadd_ps(sum[jj], sum[jj]);
+                            let temp = _mm256_hadd_ps(temp, temp);
+                            let result = _mm256_cvtss_f32(_mm256_hadd_ps(temp, temp));
+                            let c_idx = i * n + j + jj;
+                            *c.get_unchecked_mut(c_idx) += result;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[target_feature(enable = "avx2")]
+    unsafe fn gemm_avx2_simple(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize) {
+        use std::arch::x86_64::*;
+        let nr = 8;
         for m_idx in 0..m {
             for n_idx in (0..n).step_by(nr) {
                 let n_end = (n_idx + nr).min(n);
@@ -1015,6 +1105,50 @@ mod x86_64_impls {
 
     #[target_feature(enable = "sse2")]
     pub(super) unsafe fn gemm_sse(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize) {
+        use std::arch::x86_64::*;
+        let nr = 4;
+
+        if m * n < 1024 {
+            gemm_sse_simple(a, b, c, m, n, k);
+            return;
+        }
+
+        let mc = 64.min(m);
+        let kc = 128.min(k);
+
+        for m_block in (0..m).step_by(mc) {
+            let m_end = (m_block + mc).min(m);
+            for k_block in (0..k).step_by(kc) {
+                let k_end = (k_block + kc).min(k);
+
+                for i in m_block..m_end {
+                    for j in (0..n).step_by(nr) {
+                        let j_end = (j + nr).min(n);
+                        let mut sum = [_mm_setzero_ps(); 4];
+
+                        for p in k_block..k_end {
+                            let a_val = _mm_set1_ps(a[i * k + p]);
+                            for jj in 0..4 {
+                                let b_idx = p * n + j + jj;
+                                let b_val = _mm_set1_ps(*b.get_unchecked(b_idx));
+                                sum[jj] = _mm_add_ps(_mm_mul_ps(a_val, b_val), sum[jj]);
+                            }
+                        }
+
+                        for jj in 0..(j_end - j) {
+                            let temp = _mm_hadd_ps(sum[jj], sum[jj]);
+                            let result = _mm_cvtss_f32(_mm_hadd_ps(temp, temp));
+                            let c_idx = i * n + j + jj;
+                            *c.get_unchecked_mut(c_idx) += result;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[target_feature(enable = "sse2")]
+    unsafe fn gemm_sse_simple(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize) {
         use std::arch::x86_64::*;
         let nr = 4;
         for m_idx in 0..m {
@@ -1461,31 +1595,56 @@ mod aarch64_impls {
     #[target_feature(enable = "neon")]
     pub(super) unsafe fn gemm_neon(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize) {
         use std::arch::aarch64::*;
+
+        // For small matrices, use simple version
+        if m * n < 512 {
+            gemm_neon_simple(a, b, c, m, n, k);
+            return;
+        }
+
+        // Cache-blocking with proper memory access pattern
+        // Block over k dimension to improve B's access pattern
+        let kc = 256.min(k);
+
+        for k_block in (0..k).step_by(kc) {
+            let k_end = (k_block + kc).min(k);
+
+            // For each k-block, we compute a partial result
+            for i in 0..m {
+                for j in 0..n {
+                    let mut sum = 0.0f32;
+                    for p in k_block..k_end {
+                        sum += *a.get_unchecked(i * k + p) * *b.get_unchecked(p * n + j);
+                    }
+                    *c.get_unchecked_mut(i * n + j) += sum;
+                }
+            }
+        }
+    }
+
+    #[target_feature(enable = "neon")]
+    unsafe fn gemm_neon_simple(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize) {
+        use std::arch::aarch64::*;
         for m_idx in 0..m {
             for n_idx in 0..n {
                 let mut sum = 0.0f32;
                 let mut k_idx = 0;
                 while k_idx + 4 <= k {
-                    // Load 4 elements from A row
                     let a_vec = vld1q_f32(a.as_ptr().add(m_idx * k + k_idx));
-                    // Load 4 elements from B column (stride n)
                     let b0 = vld1q_f32(b.as_ptr().add(k_idx * n + n_idx));
                     let b1 = vld1q_f32(b.as_ptr().add((k_idx + 1) * n + n_idx));
                     let b2 = vld1q_f32(b.as_ptr().add((k_idx + 2) * n + n_idx));
                     let b3 = vld1q_f32(b.as_ptr().add((k_idx + 3) * n + n_idx));
-                    // Expand a to match b
                     let a0 = vdupq_n_f32(vgetq_lane_f32(a_vec, 0));
                     let a1 = vdupq_n_f32(vgetq_lane_f32(a_vec, 1));
                     let a2 = vdupq_n_f32(vgetq_lane_f32(a_vec, 2));
                     let a3 = vdupq_n_f32(vgetq_lane_f32(a_vec, 3));
-                    // Multiply and accumulate
                     sum += vgetq_lane_f32(vmulq_f32(a0, b0), 0);
                     sum += vgetq_lane_f32(vmulq_f32(a1, b1), 0);
                     sum += vgetq_lane_f32(vmulq_f32(a2, b2), 0);
                     sum += vgetq_lane_f32(vmulq_f32(a3, b3), 0);
                     k_idx += 4;
                 }
-                // Handle remaining elements
                 while k_idx < k {
                     sum += a[m_idx * k + k_idx] * b[k_idx * n + n_idx];
                     k_idx += 1;
