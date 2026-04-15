@@ -106,6 +106,7 @@ impl Default for ThreadPoolConfig {
 // ============================================================================
 
 /// Thread pool wrapper using rayon
+#[derive(Debug)]
 pub struct ThreadPool {
     num_threads: usize,
     config: ThreadPoolConfig,
@@ -288,6 +289,7 @@ impl WorkloadEstimate {
 }
 
 /// Block scheduler for decomposing operators into parallel blocks
+#[derive(Debug)]
 pub struct BlockScheduler;
 
 impl BlockScheduler {
@@ -494,7 +496,9 @@ impl LoadBalancingStrategy {
 /// Assignment of a block to a worker thread
 #[derive(Debug, Clone)]
 pub struct WorkerAssignment {
+    /// Block identifier
     pub block_id: u32,
+    /// Thread identifier
     pub thread_id: u32,
 }
 
@@ -573,6 +577,7 @@ impl CpuAffinity {
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    /// Set CPU affinity for the current thread (no-op on unsupported platforms)
     pub fn set_for_current(&self) -> Result<(), &'static str> {
         Ok(()) // No-op on unsupported platforms
     }
@@ -658,6 +663,7 @@ impl PipelineSchedule {
 // ============================================================================
 
 /// Thread scheduler for operator-level parallelism
+#[derive(Debug)]
 pub struct ThreadScheduler {
     config: SchedulerConfig,
     pool: ThreadPool,
