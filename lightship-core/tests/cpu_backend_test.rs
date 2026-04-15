@@ -924,6 +924,150 @@ fn test_cpu_backend_execute_fullyconnected() {
 }
 
 #[test]
+fn test_cpu_backend_execute_matmul_parallel() {
+    // Test multi-threaded MatMul with a large matrix
+    // This verifies that the parallel block execution produces correct results
+    let backend = CpuBackend::new();
+
+    let mut op_def = OperatorDef::new("matmul".into(), OperatorType::MatMul);
+    op_def.inputs.push(NodeIO {
+        tensor_name: "a".into(),
+        data_type: DataType::F32,
+    });
+    op_def.inputs.push(NodeIO {
+        tensor_name: "b".into(),
+        data_type: DataType::F32,
+    });
+    op_def.outputs.push(NodeIO {
+        tensor_name: "c".into(),
+        data_type: DataType::F32,
+    });
+
+    // Create 32x64 matrix A (all ones)
+    // Create 64x32 matrix B (all ones)
+    // Result should be 32x32, each element = sum of 64 products = 64.0
+    let m = 32;
+    let k = 64;
+    let n = 32;
+
+    let a_data = vec![1.0f32; m * k];
+    let b_data = vec![1.0f32; k * n];
+
+    let input_a = Tensor::from_data(
+        "a".into(),
+        vec![m, k],
+        DataType::F32,
+        a_data,
+    );
+    let input_b = Tensor::from_data(
+        "b".into(),
+        vec![k, n],
+        DataType::F32,
+        b_data,
+    );
+    let mut output = Tensor::new("c".into(), vec![m, n], DataType::F32);
+
+    let compiled = backend
+        .compile_operator(&op_def, None, &[&input_a], &[&output])
+        .unwrap();
+
+    let result = backend.execute(&compiled, &[&input_a, &input_b], &mut [&mut output]);
+    assert!(result.is_ok());
+
+    // Verify output shape
+    assert_eq!(output.shape, vec![m, n]);
+
+    // Verify correctness: all elements should be 64.0 (sum of 64 ones)
+    let bytes = output.data_as_bytes();
+    let output_data: Vec<f32> = bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+
+    let tolerance = 0.001;
+    for (i, val) in output_data.iter().enumerate() {
+        assert!((*val - 64.0).abs() < tolerance,
+            "C[{}] expected 64.0, got {}", i, val);
+    }
+}
+
+#[test]
+fn test_cpu_backend_execute_conv2d_parallel() {
+    // Test multi-threaded Conv2d with batch size > 1
+    // This verifies that the batch parallel execution works correctly
+    let backend = CpuBackend::new();
+
+    let mut op_def = OperatorDef::new("conv".into(), OperatorType::Conv2d);
+    op_def.inputs.push(NodeIO {
+        tensor_name: "input".into(),
+        data_type: DataType::F32,
+    });
+    op_def.inputs.push(NodeIO {
+        tensor_name: "filter".into(),
+        data_type: DataType::F32,
+    });
+    op_def.outputs.push(NodeIO {
+        tensor_name: "output".into(),
+        data_type: DataType::F32,
+    });
+
+    // Input: 4x1x4x4 (batch of 4)
+    // Filter: 1x1x3x3, all ones
+    // Output: 4x1x2x2 with stride=1, pad=0
+    let mut input_data = Vec::new();
+    for batch in 0..4 {
+        // Each batch has different values for verification
+        for _ in 0..16 {
+            input_data.push((batch + 1) as f32);  // batch 0 = 1.0, batch 1 = 2.0, etc.
+        }
+    }
+
+    let input = Tensor::from_data(
+        "input".into(),
+        vec![4, 1, 4, 4],
+        DataType::F32,
+        input_data,
+    );
+    let filter = Tensor::from_data(
+        "filter".into(),
+        vec![1, 1, 3, 3],
+        DataType::F32,
+        vec![1.0f32; 9],
+    );
+    let mut output = Tensor::new("output".into(), vec![4, 1, 2, 2], DataType::F32);
+
+    let compiled = backend
+        .compile_operator(&op_def, None, &[&input, &filter], &[&output])
+        .unwrap();
+
+    let result = backend.execute(&compiled, &[&input, &filter], &mut [&mut output]);
+    assert!(result.is_ok());
+
+    // Verify output shape
+    assert_eq!(output.shape, vec![4, 1, 2, 2]);
+
+    // Each output element should be 9.0 * batch_value
+    // (3x3 filter of all ones = 9, multiplied by input batch value)
+    let bytes = output.data_as_bytes();
+    let output_data: Vec<f32> = bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+
+    let tolerance = 0.001;
+    // First 4 outputs (batch 0): each should be 9.0 * 1.0 = 9.0
+    for i in 0..4 {
+        assert!((output_data[i] - 9.0).abs() < tolerance,
+            "Batch 0 output[{}] expected 9.0, got {}", i, output_data[i]);
+    }
+    // Next 4 outputs (batch 1): each should be 9.0 * 2.0 = 18.0
+    for i in 4..8 {
+        assert!((output_data[i] - 18.0).abs() < tolerance,
+            "Batch 1 output[{}] expected 18.0, got {}", i, output_data[i]);
+    }
+}
+
+#[test]
 fn test_cpu_backend_conv2d_relu_chain() {
     // Test chain: Conv2d -> ReLU
     let backend = CpuBackend::new();

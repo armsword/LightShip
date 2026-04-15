@@ -1,6 +1,8 @@
 //! CPU Backend implementation for LightShip
 
 use std::fmt::Debug;
+use std::sync::Arc;
+use rayon::prelude::*;
 use crate::backend::{
     Backend, BackendCapabilities, BackendSpecificData, CompiledOperator, CpuBackendConfig,
     MemoryBlock, SimdFlags,
@@ -11,6 +13,7 @@ use crate::common::{BackendType, DataType, LightShipError, Result, StorageLayout
 use crate::common::error::BackendError;
 use crate::ir::{FusionInfo, FusionType, OperatorDef, OperatorType, Tensor};
 use crate::platform::{add_simd, detect_simd_level, div_scalar_simd, div_simd, exp_simd, exp_softmax_simd, gemm_simd, horizontal_sum, mul_simd, relu_simd, relu6_simd, relu_simd_bytes, sub_simd, tanh_simd, SimdLevel};
+use crate::cpu::thread_scheduler::{BlockScheduler, ComputeBlock, SchedulerConfig, ThreadScheduler};
 use std::alloc::{alloc, dealloc, Layout};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -22,6 +25,8 @@ static BLOCK_ID: AtomicU64 = AtomicU64::new(0);
 pub struct CpuBackend {
     config: CpuBackendConfig,
     capabilities: BackendCapabilities,
+    /// Thread scheduler for operator-level parallelism (shared across clones)
+    thread_scheduler: Arc<ThreadScheduler>,
     /// Scratch buffer for intermediate f32 data (reused across calls)
     scratch_f32: Vec<f32>,
     /// Scratch buffer for output bytes (reused across calls)
@@ -46,9 +51,26 @@ impl CpuBackend {
     /// Create a new CPU backend with custom configuration
     pub fn with_config(config: CpuBackendConfig) -> Self {
         let capabilities = Self::build_capabilities(&config);
+
+        // Build thread scheduler config from CpuBackendConfig
+        let scheduler_config = SchedulerConfig {
+            num_threads: if config.num_threads == 0 {
+                std::thread::available_parallelism()
+                    .map(|p| p.get())
+                    .unwrap_or(1)
+            } else {
+                config.num_threads
+            },
+            enable_parallel: config.use_parallel,
+            max_block_size: 64 * 1024,
+            use_affinity: true,
+            load_balance: crate::cpu::thread_scheduler::LoadBalanceConfig::Greedy,
+        };
+
         Self {
             config,
             capabilities,
+            thread_scheduler: Arc::new(ThreadScheduler::with_config(scheduler_config)),
             // Pre-allocate scratch buffers for reuse (8MB each)
             scratch_f32: Vec::with_capacity(8 * 1024 * 1024 / 4),
             scratch_bytes: Vec::with_capacity(8 * 1024 * 1024),
@@ -974,9 +996,59 @@ impl CpuBackend {
             .collect();
         let mut c_f32 = vec![0.0f32; m * n];
 
-        // Use SIMD acceleration for GEMM
+        // Use ThreadScheduler for block-level parallel execution
+        let num_threads = self.thread_scheduler.pool().num_threads();
         let simd_level = detect_simd_level();
-        gemm_simd(&a_f32, &b_f32, &mut c_f32, *m, *n, k, simd_level);
+
+        if num_threads > 1 && *m * *n > 1024 {
+            // Decompose MatMul into blocks for parallel execution
+            let blocks = BlockScheduler::decompose_matmul(&[*m, k], &[k, *n], num_threads);
+
+            if blocks.len() > 1 {
+                // Parallel block execution using rayon
+                // Each block computes its portion and returns (offset, data) pairs
+                let n_val = *n;
+                let k_val = k;
+                let m_val = *m;
+
+                // Compute blocks in parallel and collect results
+                let results: Vec<(usize, Vec<f32>)> = blocks
+                    .into_par_iter()
+                    .filter_map(|block| {
+                        let start_row = block.start_idx / n_val;
+                        let end_row = (block.end_idx + n_val - 1) / n_val;
+                        let rows = end_row - start_row;
+
+                        if rows > 0 {
+                            let mut block_c = vec![0.0f32; rows * n_val];
+                            gemm_simd(
+                                &a_f32[start_row * k_val..(start_row + rows) * k_val],
+                                &b_f32,
+                                &mut block_c,
+                                rows,
+                                n_val,
+                                k_val,
+                                simd_level,
+                            );
+                            Some((start_row * n_val, block_c))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+
+                // Merge results into c_f32
+                for (offset, block_data) in results {
+                    c_f32[offset..offset + block_data.len()].copy_from_slice(&block_data);
+                }
+            } else {
+                // Single block - use direct GEMM
+                gemm_simd(&a_f32, &b_f32, &mut c_f32, *m, *n, k, simd_level);
+            }
+        } else {
+            // Single-threaded execution
+            gemm_simd(&a_f32, &b_f32, &mut c_f32, *m, *n, k, simd_level);
+        }
 
         // Convert result back to bytes
         let mut output_bytes = Vec::with_capacity(m * n * 4);

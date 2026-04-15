@@ -40,6 +40,8 @@ pub struct CpuBackendConfig {
     pub num_threads: usize,
     /// Enable SIMD
     pub use_simd: bool,
+    /// Enable parallel execution (multi-threading)
+    pub use_parallel: bool,
     /// Thread affinity
     pub thread_affinity: ThreadAffinity,
 }
@@ -49,6 +51,7 @@ impl Default for CpuBackendConfig {
         Self {
             num_threads: 0,
             use_simd: true,
+            use_parallel: true,
             thread_affinity: ThreadAffinity::default(),
         }
     }
