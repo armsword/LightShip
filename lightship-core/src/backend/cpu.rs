@@ -10,7 +10,7 @@ use crate::backend::memory::StorageLocation;
 use crate::common::{BackendType, DataType, LightShipError, Result, StorageLayout};
 use crate::common::error::BackendError;
 use crate::ir::{FusionInfo, FusionType, OperatorDef, OperatorType, Tensor};
-use crate::platform::{add_simd, detect_simd_level, div_scalar_simd, div_simd, exp_simd, gemm_simd, horizontal_sum, mul_simd, relu_simd, relu6_simd, sub_simd, tanh_simd, SimdLevel};
+use crate::platform::{add_simd, detect_simd_level, div_scalar_simd, div_simd, exp_simd, gemm_simd, horizontal_sum, mul_simd, relu_simd, relu6_simd, relu_simd_bytes, sub_simd, tanh_simd, SimdLevel};
 use std::alloc::{alloc, dealloc, Layout};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -431,29 +431,15 @@ impl CpuBackend {
         }
 
         let input_bytes = input.data_as_bytes();
-        let num_elements = input_bytes.len() / 4;
+        let mut output_bytes = input_bytes.to_vec();
 
-        // Convert bytes to f32 slices for SIMD processing
-        let input_f32: Vec<f32> = input_bytes
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
-
-        let mut output_f32 = vec![0.0f32; num_elements];
-
-        // Use SIMD acceleration if available
+        // Use SIMD acceleration directly on bytes - avoids f32 conversion overhead
         let simd_level = detect_simd_level();
-        relu_simd(&input_f32, &mut output_f32, simd_level);
-
-        // Convert back to bytes
-        let mut output_bytes = Vec::with_capacity(input_bytes.len());
-        for &val in &output_f32 {
-            output_bytes.extend_from_slice(&val.to_le_bytes());
-        }
+        relu_simd_bytes(&input_bytes, &mut output_bytes, simd_level);
 
         output.data = crate::ir::TensorData::Owned(output_bytes);
 
-        tracing::debug!("CPU ReLU: input shape={:?}, elements={}, simd={:?}", input.shape, num_elements, simd_level);
+        tracing::debug!("CPU ReLU: input shape={:?}, elements={}, simd={:?}", input.shape, input_bytes.len() / 4, simd_level);
         Ok(())
     }
 

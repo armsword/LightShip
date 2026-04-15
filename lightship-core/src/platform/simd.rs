@@ -121,6 +121,26 @@ pub fn relu_simd(input: &[f32], output: &mut [f32], level: SimdLevel) {
     relu_scalar(input, output, len);
 }
 
+/// ReLU on bytes directly - avoids f32 conversion overhead
+pub fn relu_simd_bytes(input: &[u8], output: &mut [u8], level: SimdLevel) {
+    let len = input.len() / 4;
+    #[cfg(target_arch = "aarch64")]
+    {
+        if matches!(level, SimdLevel::Neon | SimdLevel::Neonfp16) {
+            unsafe { relu_bytes_neon(input, output, len) };
+            return;
+        }
+    }
+    // Fallback: convert and use f32 version
+    let input_f32: &[f32] = unsafe {
+        std::slice::from_raw_parts(input.as_ptr() as *const f32, len)
+    };
+    let output_f32: &mut [f32] = unsafe {
+        std::slice::from_raw_parts_mut(output.as_ptr() as *mut f32, len)
+    };
+    relu_simd(input_f32, output_f32, level);
+}
+
 /// ReLU6: clamp(x, 0, 6) - dispatches to best available implementation
 pub fn relu6_simd(input: &[f32], output: &mut [f32], level: SimdLevel) {
     let len = input.len().min(output.len());
@@ -1483,6 +1503,27 @@ mod aarch64_impls {
         while i < len {
             output[i] = if input[i] > 0.0 { input[i] } else { 0.0 };
             i += 1;
+        }
+    }
+
+    /// ReLU on bytes directly - operates on 16 bytes at a time (4 f32 values)
+    #[target_feature(enable = "neon")]
+    pub(super) unsafe fn relu_bytes_neon(input: &[u8], output: &mut [u8], len: usize) {
+        use std::arch::aarch64::*;
+        let zero = vdupq_n_f32(0.0);
+        let mut i = 0;
+        while i + 16 <= len * 4 {
+            let data = vld1q_f32(input.as_ptr().add(i) as *const f32);
+            let result = vmaxq_f32(zero, data);
+            vst1q_f32(output.as_mut_ptr().add(i) as *mut f32, result);
+            i += 16;
+        }
+        // Handle remaining bytes
+        while i < len * 4 {
+            let val = f32::from_le_bytes([input[i], input[i+1], input[i+2], input[i+3]]);
+            let result = if val > 0.0 { val } else { 0.0 };
+            output[i..i+4].copy_from_slice(&result.to_le_bytes());
+            i += 4;
         }
     }
 
