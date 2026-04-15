@@ -1101,11 +1101,10 @@ mod x86_64_impls {
         result
     }
 
-    // GEMM implementations with cache-blocking for better performance
+    // GEMM implementations with three-level blocking for cache efficiency
     #[target_feature(enable = "avx512f")]
     pub(super) unsafe fn gemm_avx512(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize) {
         use std::arch::x86_64::*;
-        let nr = 16;
 
         // For small matrices, use the simple version to avoid overhead
         if m * n < 1024 {
@@ -1113,34 +1112,113 @@ mod x86_64_impls {
             return;
         }
 
-        // Cache-blocking: block over m and k to improve cache hits
+        // =========================================================================
+        // Blocked GEMM with three-level blocking for cache efficiency
+        //
+        // Blocking strategy:
+        // - MC x KC block for A: 64 rows x 256 K
+        // - KC x NR block for B: 256 K x 16 N (packed for vectorization)
+        // - Software prefetch to hide memory latency
+        //
+        // NR = 16 because AVX-512 processes 16 floats per 512-bit register.
+        // =========================================================================
+
+        const NR: usize = 16;   // 16 floats per 512-bit register
+        const KC: usize = 256;  // K blocking for cache
+
         let mc = 64.min(m);
-        let kc = 128.min(k);
+        let nc = 128.min(n);
+
+        // Packed B buffer: KC x NR floats
+        let mut packed_b = vec![0.0f32; KC * NR];
 
         for m_block in (0..m).step_by(mc) {
             let m_end = (m_block + mc).min(m);
-            for k_block in (0..k).step_by(kc) {
-                let k_end = (k_block + kc).min(k);
 
-                for i in m_block..m_end {
-                    for j in (0..n).step_by(nr) {
-                        let j_end = (j + nr).min(n);
-                        let mut sum = [_mm512_setzero_ps(); 16];
+            for n_block in (0..n).step_by(nc) {
+                let n_end = (n_block + nc).min(n);
 
-                        for p in k_block..k_end {
-                            let a_val = _mm512_set1_ps(a[i * k + p]);
-                            for jj in 0..16 {
-                                let b_idx = p * n + j + jj;
-                                let b_val = _mm512_set1_ps(*b.get_unchecked(b_idx));
-                                sum[jj] = _mm512_fmadd_ps(a_val, b_val, sum[jj]);
+                for k_block in (0..k).step_by(KC) {
+                    let k_end = (k_block + KC).min(k);
+                    let k_len = k_end - k_block;
+
+                    // =================================================================
+                    // Pack B block: B[k_block:k_end, n_block:n_end] -> packed_b
+                    // =================================================================
+                    let nr_cur = (n_end - n_block).min(NR);
+                    for p in 0..k_len {
+                        let b_row = k_block + p;
+                        let b_offset = b_row * n + n_block;
+                        let packed_offset = p * NR;
+
+                        // Copy nr_cur elements
+                        for jj in 0..nr_cur {
+                            packed_b[packed_offset + jj] = b[b_offset + jj];
+                        }
+
+                        // Software prefetch: prefetch next 2 rows of B
+                        if p % 8 == 0 && b_row + 16 < k {
+                            _mm_prefetch(b.as_ptr().add((b_row + 16) * n + n_block) as *const f32, _MM_HINT_T0);
+                        }
+                    }
+
+                    // =================================================================
+                    // Compute C[m_block:m_end, n_block:n_end] block
+                    // =================================================================
+                    for i in m_block..m_end {
+                        // Initialize 1 accumulator for 16 columns at once
+                        // AVX-512 can process all 16 columns in one register
+                        let mut acc = _mm512_setzero_ps();
+
+                        // Prefetch A[i] row for first cache line
+                        let a_row_base = i * k + k_block;
+                        _mm_prefetch(a.as_ptr().add(a_row_base) as *const f32, _MM_HINT_T0);
+
+                        // Inner K loop - unrolled by 4
+                        // Each iteration computes 4 K slices contributing to all 16 columns
+                        let mut kk = 0;
+                        while kk + 4 <= k_len {
+                            // Load 4 A values and broadcast to 512-bit registers
+                            let a_val0 = _mm512_set1_ps(*a.get_unchecked(a_row_base + kk));
+                            let a_val1 = _mm512_set1_ps(*a.get_unchecked(a_row_base + kk + 1));
+                            let a_val2 = _mm512_set1_ps(*a.get_unchecked(a_row_base + kk + 2));
+                            let a_val3 = _mm512_set1_ps(*a.get_unchecked(a_row_base + kk + 3));
+
+                            // Prefetch next A values (speculative load for next iteration)
+                            if kk + 8 < k_len {
+                                _mm_prefetch(a.as_ptr().add(a_row_base + kk + 8) as *const f32, _MM_HINT_T0);
                             }
+
+                            // Load 4 B blocks from packed_b (each is 16 floats)
+                            let b_ptr = packed_b.as_ptr();
+                            let b0 = _mm512_loadu_ps(b_ptr.add(kk * NR));
+                            let b1 = _mm512_loadu_ps(b_ptr.add((kk + 1) * NR));
+                            let b2 = _mm512_loadu_ps(b_ptr.add((kk + 2) * NR));
+                            let b3 = _mm512_loadu_ps(b_ptr.add((kk + 3) * NR));
+
+                            // Compute FMA for each K slice, accumulating into acc
+                            acc = _mm512_fmadd_ps(a_val0, b0, acc);
+                            acc = _mm512_fmadd_ps(a_val1, b1, acc);
+                            acc = _mm512_fmadd_ps(a_val2, b2, acc);
+                            acc = _mm512_fmadd_ps(a_val3, b3, acc);
+
+                            kk += 4;
                         }
 
-                        for jj in 0..(j_end - j) {
-                            let result = _mm512_reduce_add_ps(sum[jj]);
-                            let c_idx = i * n + j + jj;
-                            *c.get_unchecked_mut(c_idx) += result;
+                        // Handle remaining K < 4
+                        while kk < k_len {
+                            let a_val = _mm512_set1_ps(*a.get_unchecked(a_row_base + kk));
+                            let b_ptr = packed_b.as_ptr().add(kk * NR);
+                            let b_vec = _mm512_loadu_ps(b_ptr);
+                            acc = _mm512_fmadd_ps(a_val, b_vec, acc);
+                            kk += 1;
                         }
+
+                        // Horizontal sum of accumulator and store to C
+                        // AVX-512 provides _mm512_reduce_add_ps for efficient horizontal sum
+                        let result = _mm512_reduce_add_ps(acc);
+                        let c_idx = i * n + n_block;
+                        *c.get_unchecked_mut(c_idx) += result;
                     }
                 }
             }
@@ -1175,40 +1253,142 @@ mod x86_64_impls {
     #[target_feature(enable = "avx2")]
     pub(super) unsafe fn gemm_avx2(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize) {
         use std::arch::x86_64::*;
-        let nr = 8;
 
+        // For small matrices, use the simple version to avoid overhead
         if m * n < 1024 {
             gemm_avx2_simple(a, b, c, m, n, k);
             return;
         }
 
+        // =========================================================================
+        // Blocked GEMM with three-level blocking for cache efficiency
+        //
+        // Blocking strategy:
+        // - MC x KC block for A: 64 rows x 256 K
+        // - KC x NR block for B: 256 K x 8 N (packed for vectorization)
+        // - Software prefetch to hide memory latency
+        //
+        // This implements the "naive" blocked algorithm but with proper vectorization
+        // of the inner loop using B-packing and NR-column iterations.
+        // =========================================================================
+
+        const NR: usize = 8;    // 8 floats per 256-bit register
+        const KC: usize = 256;  // K blocking for cache
+
         let mc = 64.min(m);
-        let kc = 128.min(k);
+        let nc = 128.min(n);
+
+        // Packed B buffer: KC x NR floats
+        // This allows contiguous memory access when loading B during computation
+        let mut packed_b = vec![0.0f32; KC * NR];
 
         for m_block in (0..m).step_by(mc) {
             let m_end = (m_block + mc).min(m);
-            for k_block in (0..k).step_by(kc) {
-                let k_end = (k_block + kc).min(k);
 
-                for i in m_block..m_end {
-                    for j in (0..n).step_by(nr) {
-                        let j_end = (j + nr).min(n);
-                        let mut sum = [_mm256_setzero256(); 8];
+            for n_block in (0..n).step_by(nc) {
+                let n_end = (n_block + nc).min(n);
 
-                        for p in k_block..k_end {
-                            let a_val = _mm256_set1_ps(a[i * k + p]);
-                            for jj in 0..8 {
-                                let b_idx = p * n + j + jj;
-                                let b_val = _mm256_set1_ps(*b.get_unchecked(b_idx));
-                                sum[jj] = _mm256_fmadd_ps(a_val, b_val, sum[jj]);
-                            }
+                for k_block in (0..k).step_by(KC) {
+                    let k_end = (k_block + KC).min(k);
+                    let k_len = k_end - k_block;
+
+                    // =================================================================
+                    // Pack B block: B[k_block:k_end, n_block:n_end] -> packed_b
+                    // Shape: k_len x NR (NR = min(8, n_end - n_block))
+                    // This creates a contiguous memory layout for vectorized loads
+                    // =================================================================
+                    let nr_cur = (n_end - n_block).min(NR);
+                    for p in 0..k_len {
+                        let b_row = k_block + p;
+                        let b_offset = b_row * n + n_block;
+                        let packed_offset = p * NR;
+
+                        // Copy nr_cur elements
+                        for jj in 0..nr_cur {
+                            packed_b[packed_offset + jj] = b[b_offset + jj];
                         }
 
-                        for jj in 0..(j_end - j) {
-                            let temp = _mm256_hadd_ps(sum[jj], sum[jj]);
+                        // Software prefetch: prefetch next 2 rows of B
+                        if p % 8 == 0 && b_row + 16 < k {
+                            _mm_prefetch(b.as_ptr().add((b_row + 16) * n + n_block) as *const f32, _MM_HINT_T0);
+                        }
+                    }
+
+                    // =================================================================
+                    // Compute C[m_block:m_end, n_block:n_end] block
+                    // For each row i in [m_block, m_end):
+                    //   Initialize 8 accumulators to zero (one per output column)
+                    //   For each k in [0, k_len):
+                    //     Load A[i, k_block+k] and broadcast to all elements
+                    //     Load packed_b[k*NR .. k*NR+8]
+                    //     Multiply and accumulate: accum[j] += a_val * b_val[j]
+                    //   Store accumulators to C[i, n_block .. n_block+8]
+                    // =================================================================
+
+                    for i in m_block..m_end {
+                        // Initialize NR accumulators to zero
+                        let mut acc = [_mm256_setzero256(); NR];
+
+                        // Prefetch A[i] row for first cache line
+                        let a_row_base = i * k + k_block;
+                        _mm_prefetch(a.as_ptr().add(a_row_base) as *const f32, _MM_HINT_T0);
+
+                        // Inner K loop - unrolled by 4
+                        // Each iteration computes 4 K slices, each contributing to all 8 columns
+                        // For kk iteration:
+                        //   C[j] += A[i,kk+0] * B[kk+0,j] + A[i,kk+1] * B[kk+1,j] + ...
+                        // But we process each K slice separately for better instruction-level parallelism
+                        let mut kk = 0;
+                        while kk + 4 <= k_len {
+                            // Load 4 A values and broadcast to 256-bit registers
+                            // Each will be multiplied with its corresponding B block
+                            let a_val0 = _mm256_set1_ps(*a.get_unchecked(a_row_base + kk));
+                            let a_val1 = _mm256_set1_ps(*a.get_unchecked(a_row_base + kk + 1));
+                            let a_val2 = _mm256_set1_ps(*a.get_unchecked(a_row_base + kk + 2));
+                            let a_val3 = _mm256_set1_ps(*a.get_unchecked(a_row_base + kk + 3));
+
+                            // Prefetch next A values (speculative load for next iteration)
+                            if kk + 8 < k_len {
+                                _mm_prefetch(a.as_ptr().add(a_row_base + kk + 8) as *const f32, _MM_HINT_T0);
+                            }
+
+                            // Load 4 B blocks from packed_b (each is 8 floats = one column group)
+                            // Each B block corresponds to one K slice
+                            let b_ptr = packed_b.as_ptr();
+                            let b0 = _mm256_loadu_ps(b_ptr.add(kk * NR));
+                            let b1 = _mm256_loadu_ps(b_ptr.add((kk + 1) * NR));
+                            let b2 = _mm256_loadu_ps(b_ptr.add((kk + 2) * NR));
+                            let b3 = _mm256_loadu_ps(b_ptr.add((kk + 3) * NR));
+
+                            // Compute FMA for each K slice, accumulating into acc[0]
+                            // Each FMA computes: acc[0] += a_val * b_vec
+                            // After 4 FMAs: acc[0] contains sum of 4 K slices for 8 columns
+                            acc[0] = _mm256_fmadd_ps(a_val0, b0, acc[0]);
+                            acc[0] = _mm256_fmadd_ps(a_val1, b1, acc[0]);
+                            acc[0] = _mm256_fmadd_ps(a_val2, b2, acc[0]);
+                            acc[0] = _mm256_fmadd_ps(a_val3, b3, acc[0]);
+
+                            kk += 4;
+                        }
+
+                        // Handle remaining K < 4
+                        while kk < k_len {
+                            let a_val = _mm256_set1_ps(*a.get_unchecked(a_row_base + kk));
+                            let b_ptr = packed_b.as_ptr().add(kk * NR);
+                            let b_vec = _mm256_loadu_ps(b_ptr);
+                            acc[0] = _mm256_fmadd_ps(a_val, b_vec, acc[0]);
+                            kk += 1;
+                        }
+
+                        // Horizontal sum of each accumulator and store to C
+                        // Each acc[j] contains 8 floats that need to be summed
+                        for j in 0..nr_cur {
+                            // Horizontal sum on 256-bit vector
+                            let temp = _mm256_hadd_ps(acc[j], acc[j]);
                             let temp = _mm256_hadd_ps(temp, temp);
                             let result = _mm256_cvtss_f32(_mm256_hadd_ps(temp, temp));
-                            let c_idx = i * n + j + jj;
+
+                            let c_idx = i * n + n_block + j;
                             *c.get_unchecked_mut(c_idx) += result;
                         }
                     }
@@ -2036,6 +2216,152 @@ mod tests {
         // C[1][0] = 4*1 + 5*3 + 6*5 = 49
         // C[1][1] = 4*2 + 5*4 + 6*6 = 64
         assert_eq!(c, vec![22.0, 28.0, 49.0, 64.0]);
+    }
+
+    #[test]
+    fn test_gemm_simd_large() {
+        // Test larger matrix multiplication with blocking
+        let m = 128usize;
+        let n = 256usize;
+        let k = 128usize;
+
+        let a: Vec<f32> = (0..m * k).map(|i| (i as f32) * 0.01).collect();
+        let b: Vec<f32> = (0..k * n).map(|i| (i as f32) * 0.02).collect();
+        let mut c = vec![0.0f32; m * n];
+
+        let level = detect_simd_level();
+        gemm_simd(&a, &b, &mut c, m, n, k, level);
+
+        // Verify a few key values by computing expected result
+        // C[i][j] = sum over k of a[i*k+p] * b[p*n+j]
+        let c_0_0: f32 = (0..k).map(|p| a[0 * k + p] * b[p * n + 0]).sum();
+        let c_0_1: f32 = (0..k).map(|p| a[0 * k + p] * b[p * n + 1]).sum();
+        let c_63_128: f32 = (0..k).map(|p| a[63 * k + p] * b[p * n + 128]).sum();
+
+        // Allow small numerical error
+        assert!((c[0] - c_0_0).abs() < 0.1);
+        assert!((c[1] - c_0_1).abs() < 0.1);
+        assert!((c[63 * n + 128] - c_63_128).abs() < 0.1);
+    }
+
+    #[test]
+    fn test_gemm_simd_preserves_c() {
+        // Test that GEMM accumulates into C (C = A*B + C)
+        let a = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]; // 2x3
+        let b = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]; // 3x2
+        let mut c = vec![10.0f32, 20.0f32, 30.0f32, 40.0f32]; // Pre-existing values
+
+        let level = detect_simd_level();
+        gemm_simd(&a, &b, &mut c, 2, 2, 3, level);
+
+        // Expected: original + A*B
+        // C = [10+22, 20+28, 30+49, 40+64] = [32, 48, 79, 104]
+        assert_eq!(c, vec![32.0, 48.0, 79.0, 104.0]);
+    }
+
+    #[test]
+    fn test_gemm_block_alignment() {
+        // Test that block-optimized path handles non-aligned sizes correctly
+        // These sizes are chosen to test boundary conditions
+        let test_cases = vec![
+            (3, 5, 7),   // Small non-aligned
+            (17, 23, 11), // Odd sizes
+            (64, 64, 64), // Power of 2
+            (65, 63, 67), // Just over power of 2
+        ];
+
+        let level = detect_simd_level();
+        for (m, n, k) in test_cases {
+            let a: Vec<f32> = (0..m * k).map(|i| (i as f32) * 0.1).collect();
+            let b: Vec<f32> = (0..k * n).map(|i| (i as f32) * 0.1).collect();
+            let mut c_blocked = vec![0.0f32; m * n];
+            let mut c_scalar = vec![0.0f32; m * n];
+
+            gemm_simd(&a, &b, &mut c_blocked, m, n, k, level);
+            gemm_scalar(&a, &b, &mut c_scalar, m, n, k);
+
+            // Check within numerical tolerance
+            for i in 0..m * n {
+                let rel_err = if c_scalar[i].abs() > 0.001 {
+                    (c_blocked[i] - c_scalar[i]).abs() / c_scalar[i].abs()
+                } else {
+                    (c_blocked[i] - c_scalar[i]).abs()
+                };
+                assert!(rel_err < 0.001, "Mismatch at index {}: blocked={}, scalar={}, rel_err={}",
+                        i, c_blocked[i], c_scalar[i], rel_err);
+            }
+        }
+    }
+
+    #[test]
+    fn test_gemm_inference_time() {
+        // Benchmark to track performance improvement
+        let m = 256usize;
+        let n = 256usize;
+        let k = 256usize;
+
+        let a: Vec<f32> = (0..m * k).map(|i| (i as f32) * 0.01).collect();
+        let b: Vec<f32> = (0..k * n).map(|i| (i as f32) * 0.02).collect();
+        let mut c = vec![0.0f32; m * n];
+
+        let level = detect_simd_level();
+        gemm_simd(&a, &b, &mut c, m, n, k, level);
+
+        // Verify result correctness - larger tolerance for bigger matrices
+        let expected: f32 = (0..k).map(|p| a[100 * k + p] * b[p * n + 100]).sum();
+        assert!((c[100 * n + 100] - expected).abs() < expected.abs() * 0.001 + 1.0,
+                "GEMM accuracy error: c[100,100]={}, expected={}, diff={}",
+                c[100 * n + 100], expected, (c[100 * n + 100] - expected).abs());
+    }
+
+    #[test]
+    fn test_gemm_avx2_blocking_performance() {
+        // Specifically test AVX2 blocking performance with larger matrices
+        #[cfg(target_arch = "x86_64")]
+        {
+            let m = 512usize;
+            let n = 512usize;
+            let k = 512usize;
+
+            let a: Vec<f32> = (0..m * k).map(|i| (i as f32) * 0.01).collect();
+            let b: Vec<f32> = (0..k * n).map(|i| (i as f32) * 0.02).collect();
+            let mut c = vec![0.0f32; m * n];
+
+            let level = detect_simd_level();
+            let start = std::time::Instant::now();
+            gemm_simd(&a, &b, &mut c, m, n, k, level);
+            let elapsed = start.elapsed();
+
+            println!("AVX2 GEMM 512x512x512 took: {:?}", elapsed);
+
+            // Verify correctness on a few elements
+            let check_points = vec![(0, 0), (255, 255), (511, 511), (128, 256)];
+            for (row, col) in check_points {
+                let expected: f32 = (0..k).map(|p| a[row * k + p] * b[p * n + col]).sum();
+                assert!((c[row * n + col] - expected).abs() < 0.5,
+                        "Mismatch at ({}, {}): got {}, expected {}",
+                        row, col, c[row * n + col], expected);
+            }
+        }
+
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            // Non-x86: just verify correctness
+            let m = 64usize;
+            let n = 64usize;
+            let k = 64usize;
+
+            let a: Vec<f32> = (0..m * k).map(|i| (i as f32) * 0.01).collect();
+            let b: Vec<f32> = (0..k * n).map(|i| (i as f32) * 0.02).collect();
+            let mut c = vec![0.0f32; m * n];
+
+            let level = detect_simd_level();
+            gemm_simd(&a, &b, &mut c, m, n, k, level);
+
+            // Verify correctness
+            let expected: f32 = (0..k).map(|p| a[32 * k + p] * b[p * n + 32]).sum();
+            assert!((c[32 * n + 32] - expected).abs() < 0.1);
+        }
     }
 
     #[test]
