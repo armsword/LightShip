@@ -1716,8 +1716,6 @@ mod aarch64_impls {
     pub(super) unsafe fn gemm_neon(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize) {
         use std::arch::aarch64::*;
 
-        let nr = 4; // NEON register width: 128-bit = 4 f32
-
         // For small matrices, use the simple version
         if m * n < 512 {
             gemm_neon_simple(a, b, c, m, n, k);
@@ -1726,7 +1724,7 @@ mod aarch64_impls {
 
         // Cache-blocking: block over m and k for better cache utilization
         let mc = 64.min(m);
-        let kc = 256.min(k);
+        let kc = 128.min(k);
 
         for k_block in (0..k).step_by(kc) {
             let k_end = (k_block + kc).min(k);
@@ -1735,30 +1733,96 @@ mod aarch64_impls {
                 let m_end = (m_block + mc).min(m);
 
                 for i in m_block..m_end {
-                    for j in (0..n).step_by(nr) {
-                        let j_end = (j + nr).min(n);
-                        let mut sum = [0.0f32; 4]; // Scalar accumulation
+                    let mut j = 0;
+                    // Process 4 elements at a time when possible
+                    while j + 16 <= n {
+                        let mut sum0 = 0.0f32;
+                        let mut sum1 = 0.0f32;
+                        let mut sum2 = 0.0f32;
+                        let mut sum3 = 0.0f32;
+                        let mut sum4 = 0.0f32;
+                        let mut sum5 = 0.0f32;
+                        let mut sum6 = 0.0f32;
+                        let mut sum7 = 0.0f32;
+                        let mut sum8 = 0.0f32;
+                        let mut sum9 = 0.0f32;
+                        let mut sum10 = 0.0f32;
+                        let mut sum11 = 0.0f32;
+                        let mut sum12 = 0.0f32;
+                        let mut sum13 = 0.0f32;
+                        let mut sum14 = 0.0f32;
+                        let mut sum15 = 0.0f32;
 
                         for p in k_block..k_end {
                             let a_val = *a.get_unchecked(i * k + p);
-                            // Load 4 B values and multiply with broadcasted a_val
-                            let b0 = *b.get_unchecked(p * n + j);
-                            let b1 = *b.get_unchecked(p * n + j + 1);
-                            let b2 = *b.get_unchecked(p * n + j + 2);
-                            let b3 = *b.get_unchecked(p * n + j + 3);
+                            let a_val2 = vdupq_n_f32(a_val);
+                            let b_ptr = b.as_ptr().add(p * n + j);
 
-                            sum[0] += a_val * b0;
-                            if j_end > j + 1 { sum[1] += a_val * b1; }
-                            if j_end > j + 2 { sum[2] += a_val * b2; }
-                            if j_end > j + 3 { sum[3] += a_val * b3; }
+                            // Process 16 B values at once
+                            let b0 = *b_ptr;
+                            let b1 = *b_ptr.add(1);
+                            let b2 = *b_ptr.add(2);
+                            let b3 = *b_ptr.add(3);
+                            let b4 = *b_ptr.add(4);
+                            let b5 = *b_ptr.add(5);
+                            let b6 = *b_ptr.add(6);
+                            let b7 = *b_ptr.add(7);
+                            let b8 = *b_ptr.add(8);
+                            let b9 = *b_ptr.add(9);
+                            let b10 = *b_ptr.add(10);
+                            let b11 = *b_ptr.add(11);
+                            let b12 = *b_ptr.add(12);
+                            let b13 = *b_ptr.add(13);
+                            let b14 = *b_ptr.add(14);
+                            let b15 = *b_ptr.add(15);
+
+                            sum0 += a_val * b0;
+                            sum1 += a_val * b1;
+                            sum2 += a_val * b2;
+                            sum3 += a_val * b3;
+                            sum4 += a_val * b4;
+                            sum5 += a_val * b5;
+                            sum6 += a_val * b6;
+                            sum7 += a_val * b7;
+                            sum8 += a_val * b8;
+                            sum9 += a_val * b9;
+                            sum10 += a_val * b10;
+                            sum11 += a_val * b11;
+                            sum12 += a_val * b12;
+                            sum13 += a_val * b13;
+                            sum14 += a_val * b14;
+                            sum15 += a_val * b15;
                         }
 
-                        // Store results
                         let c_idx = i * n + j;
-                        *c.get_unchecked_mut(c_idx) += sum[0];
-                        if j_end > j + 1 { *c.get_unchecked_mut(c_idx + 1) += sum[1]; }
-                        if j_end > j + 2 { *c.get_unchecked_mut(c_idx + 2) += sum[2]; }
-                        if j_end > j + 3 { *c.get_unchecked_mut(c_idx + 3) += sum[3]; }
+                        *c.get_unchecked_mut(c_idx) += sum0;
+                        *c.get_unchecked_mut(c_idx + 1) += sum1;
+                        *c.get_unchecked_mut(c_idx + 2) += sum2;
+                        *c.get_unchecked_mut(c_idx + 3) += sum3;
+                        *c.get_unchecked_mut(c_idx + 4) += sum4;
+                        *c.get_unchecked_mut(c_idx + 5) += sum5;
+                        *c.get_unchecked_mut(c_idx + 6) += sum6;
+                        *c.get_unchecked_mut(c_idx + 7) += sum7;
+                        *c.get_unchecked_mut(c_idx + 8) += sum8;
+                        *c.get_unchecked_mut(c_idx + 9) += sum9;
+                        *c.get_unchecked_mut(c_idx + 10) += sum10;
+                        *c.get_unchecked_mut(c_idx + 11) += sum11;
+                        *c.get_unchecked_mut(c_idx + 12) += sum12;
+                        *c.get_unchecked_mut(c_idx + 13) += sum13;
+                        *c.get_unchecked_mut(c_idx + 14) += sum14;
+                        *c.get_unchecked_mut(c_idx + 15) += sum15;
+                        j += 16;
+                    }
+                    // Handle remaining n % 16
+                    while j < n {
+                        let mut sum = 0.0f32;
+                        for p in k_block..k_end {
+                            let a_val = *a.get_unchecked(i * k + p);
+                            let b_val = *b.get_unchecked(p * n + j);
+                            sum += a_val * b_val;
+                        }
+                        *c.get_unchecked_mut(i * n + j) += sum;
+                        j += 1;
                     }
                 }
             }
