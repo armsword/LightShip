@@ -290,7 +290,7 @@ pub fn exp_simd(input: &[f32], output: &mut [f32], level: SimdLevel) {
 // Softmax-specific fast exp using lookup table (x in [-10, 0])
 // ============================================================================
 
-const SOFTMAX_EXP_TABLE_SIZE: usize = 256;
+const SOFTMAX_EXP_TABLE_SIZE: usize = 1024;
 const SOFTMAX_EXP_MIN: f32 = -10.0;
 const SOFTMAX_EXP_MAX: f32 = 0.0;
 const SOFTMAX_EXP_STEP: f32 = (SOFTMAX_EXP_MAX - SOFTMAX_EXP_MIN) / (SOFTMAX_EXP_TABLE_SIZE - 1) as f32;
