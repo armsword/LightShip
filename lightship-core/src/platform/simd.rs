@@ -1596,27 +1596,50 @@ mod aarch64_impls {
     pub(super) unsafe fn gemm_neon(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize) {
         use std::arch::aarch64::*;
 
-        // For small matrices, use simple version
+        let nr = 4; // NEON register width: 128-bit = 4 f32
+
+        // For small matrices, use the simple version
         if m * n < 512 {
             gemm_neon_simple(a, b, c, m, n, k);
             return;
         }
 
-        // Cache-blocking with proper memory access pattern
-        // Block over k dimension to improve B's access pattern
+        // Cache-blocking: block over m and k for better cache utilization
+        let mc = 64.min(m);
         let kc = 256.min(k);
 
         for k_block in (0..k).step_by(kc) {
             let k_end = (k_block + kc).min(k);
 
-            // For each k-block, we compute a partial result
-            for i in 0..m {
-                for j in 0..n {
-                    let mut sum = 0.0f32;
-                    for p in k_block..k_end {
-                        sum += *a.get_unchecked(i * k + p) * *b.get_unchecked(p * n + j);
+            for m_block in (0..m).step_by(mc) {
+                let m_end = (m_block + mc).min(m);
+
+                for i in m_block..m_end {
+                    for j in (0..n).step_by(nr) {
+                        let j_end = (j + nr).min(n);
+                        let mut sum = [0.0f32; 4]; // Scalar accumulation
+
+                        for p in k_block..k_end {
+                            let a_val = *a.get_unchecked(i * k + p);
+                            // Load 4 B values and multiply with broadcasted a_val
+                            let b0 = *b.get_unchecked(p * n + j);
+                            let b1 = *b.get_unchecked(p * n + j + 1);
+                            let b2 = *b.get_unchecked(p * n + j + 2);
+                            let b3 = *b.get_unchecked(p * n + j + 3);
+
+                            sum[0] += a_val * b0;
+                            if j_end > j + 1 { sum[1] += a_val * b1; }
+                            if j_end > j + 2 { sum[2] += a_val * b2; }
+                            if j_end > j + 3 { sum[3] += a_val * b3; }
+                        }
+
+                        // Store results
+                        let c_idx = i * n + j;
+                        *c.get_unchecked_mut(c_idx) += sum[0];
+                        if j_end > j + 1 { *c.get_unchecked_mut(c_idx + 1) += sum[1]; }
+                        if j_end > j + 2 { *c.get_unchecked_mut(c_idx + 2) += sum[2]; }
+                        if j_end > j + 3 { *c.get_unchecked_mut(c_idx + 3) += sum[3]; }
                     }
-                    *c.get_unchecked_mut(i * n + j) += sum;
                 }
             }
         }
