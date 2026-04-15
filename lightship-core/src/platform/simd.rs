@@ -287,81 +287,15 @@ pub fn exp_simd(input: &[f32], output: &mut [f32], level: SimdLevel) {
 }
 
 // ============================================================================
-// Softmax-specific fast exp using lookup table (x in [-10, 0])
+// Softmax exp using std::exp
 // ============================================================================
 
-const SOFTMAX_EXP_TABLE_SIZE: usize = 1024;
-const SOFTMAX_EXP_MIN: f32 = -10.0;
-const SOFTMAX_EXP_MAX: f32 = 0.0;
-const SOFTMAX_EXP_STEP: f32 = (SOFTMAX_EXP_MAX - SOFTMAX_EXP_MIN) / (SOFTMAX_EXP_TABLE_SIZE - 1) as f32;
-
-fn build_softmax_exp_table() -> [f32; SOFTMAX_EXP_TABLE_SIZE] {
-    let mut table = [0.0f32; SOFTMAX_EXP_TABLE_SIZE];
-    for i in 0..SOFTMAX_EXP_TABLE_SIZE {
-        let x = SOFTMAX_EXP_MIN + i as f32 * SOFTMAX_EXP_STEP;
-        table[i] = x.exp();
-    }
-    table
-}
-
-#[inline]
-fn softmax_exp_approx(x: f32) -> f32 {
-    let x = x.clamp(SOFTMAX_EXP_MIN, SOFTMAX_EXP_MAX);
-    let normalized = (x - SOFTMAX_EXP_MIN) / SOFTMAX_EXP_STEP;
-    let index = normalized as usize;
-    let fraction = normalized - index as f32;
-    let table = SOFTMAX_EXP_TABLE.get().unwrap();
-    let lo = table[index.min(SOFTMAX_EXP_TABLE_SIZE - 1)];
-    let hi = table[(index + 1).min(SOFTMAX_EXP_TABLE_SIZE - 1)];
-    lo + (hi - lo) * fraction
-}
-
-use std::sync::OnceLock;
-static SOFTMAX_EXP_TABLE: OnceLock<[f32; SOFTMAX_EXP_TABLE_SIZE]> = OnceLock::new();
-
-/// Fast exp for softmax - uses lookup table for x in [-10, 0]
-pub fn exp_softmax_simd(input: &[f32], output: &mut [f32], level: SimdLevel) {
+/// Fast exp for softmax - uses std::exp for accuracy
+pub fn exp_softmax_simd(input: &[f32], output: &mut [f32], _level: SimdLevel) {
     let len = input.len().min(output.len());
-    let _ = SOFTMAX_EXP_TABLE.get_or_init(build_softmax_exp_table);
-    #[cfg(target_arch = "aarch64")]
-    {
-        if matches!(level, SimdLevel::Neon | SimdLevel::Neonfp16) {
-            unsafe { exp_softmax_neon(input, output, len) };
-            return;
-        }
-    }
-    // Fallback: use scalar approximation
+    // For softmax, accuracy is critical. Use std::exp which is well-optimized.
     for i in 0..len {
-        output[i] = softmax_exp_approx(input[i]);
-    }
-}
-
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "neon")]
-unsafe fn exp_softmax_neon(input: &[f32], output: &mut [f32], len: usize) {
-    use std::arch::aarch64::*;
-    let table = SOFTMAX_EXP_TABLE.get().unwrap();
-    let step = SOFTMAX_EXP_STEP;
-    let min_val = SOFTMAX_EXP_MIN;
-    let mut i = 0;
-    while i + 4 <= len {
-        let mut vals = [0.0f32; 4];
-        for j in 0..4 {
-            let x = input[i + j].clamp(min_val, 0.0);
-            let normalized = (x - min_val) / step;
-            let index = normalized as usize;
-            let fraction = normalized - index as f32;
-            let lo = table[index.min(SOFTMAX_EXP_TABLE_SIZE - 1)];
-            let hi = table[(index + 1).min(SOFTMAX_EXP_TABLE_SIZE - 1)];
-            vals[j] = lo + (hi - lo) * fraction;
-        }
-        let result = vld1q_f32(vals.as_ptr());
-        vst1q_f32(&mut output[i], result);
-        i += 4;
-    }
-    while i < len {
-        output[i] = softmax_exp_approx(input[i]);
-        i += 1;
+        output[i] = input[i].exp();
     }
 }
 
