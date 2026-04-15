@@ -287,15 +287,123 @@ pub fn exp_simd(input: &[f32], output: &mut [f32], level: SimdLevel) {
 }
 
 // ============================================================================
-// Softmax exp using std::exp
+// SIMD-accelerated exp for softmax using lookup table + interpolation
 // ============================================================================
 
-/// Fast exp for softmax - uses std::exp for accuracy
-pub fn exp_softmax_simd(input: &[f32], output: &mut [f32], _level: SimdLevel) {
+const EXP_TABLE_SIZE: usize = 512;
+const EXP_MIN: f32 = -10.0;
+const EXP_MAX: f32 = 0.0;
+const EXP_STEP: f32 = (EXP_MAX - EXP_MIN) / (EXP_TABLE_SIZE - 1) as f32;
+const EXP_STEP_INV: f32 = 1.0 / EXP_STEP;
+
+fn build_exp_table() -> [f32; EXP_TABLE_SIZE] {
+    let mut table = [0.0f32; EXP_TABLE_SIZE];
+    for i in 0..EXP_TABLE_SIZE {
+        let x = EXP_MIN + i as f32 * EXP_STEP;
+        table[i] = x.exp();
+    }
+    table
+}
+
+static EXP_TABLE: std::sync::OnceLock<[f32; EXP_TABLE_SIZE]> = std::sync::OnceLock::new();
+
+fn get_exp_table() -> &'static [f32; EXP_TABLE_SIZE] {
+    EXP_TABLE.get_or_init(build_exp_table)
+}
+
+/// SIMD-accelerated exp using lookup table + linear interpolation
+/// Optimized for softmax where x ∈ (-∞, 0] after max subtraction
+#[target_feature(enable = "neon")]
+unsafe fn exp_simd_neon(input: &[f32], output: &mut [f32], len: usize) {
+    use std::arch::aarch64::*;
+    let table = get_exp_table();
+    let step_inv = vdupq_n_f32(EXP_STEP_INV);
+    let min_val = vdupq_n_f32(EXP_MIN);
+    let max_idx = (EXP_TABLE_SIZE - 2) as f32;
+    let mut i = 0;
+
+    // Pre-load table into NEON registers for faster access
+    // Process 4 elements at a time
+    while i + 4 <= len {
+        // Load 4 floats
+        let x = vld1q_f32(input.as_ptr().add(i));
+
+        // Clamp to [EXP_MIN, 0]
+        let x_clamped = vmaxq_f32(x, min_val);
+        let x_final = vminq_f32(x_clamped, vdupq_n_f32(0.0));
+
+        // Normalize: (x - min) / step
+        let normalized = vmulq_f32(vsubq_f32(x_final, min_val), step_inv);
+
+        // Convert to integer indices using ARM NEON's vector round
+        // Use vcvtq to convert float to unsigned 32-bit, then clamp
+        let idx_f = vminq_f32(vmaxq_f32(normalized, vdupq_n_f32(0.0)), vdupq_n_f32(max_idx));
+        let idx = vcvtq_u32_f32(idx_f);
+        let idx_next = vminq_u32(vaddq_u32(idx, vdupq_n_u32(1)), vdupq_n_u32((EXP_TABLE_SIZE - 1) as u32));
+
+        // Calculate fractional part
+        let idx_f32 = vcvtq_f32_u32(idx);
+        let fraction = vsubq_f32(normalized, idx_f32);
+
+        // Gather lo values: table[idx[i]]
+        // For NEON, we need to do scalar loads since there's no good gather
+        let idx_arr: [u32; 4] = std::mem::transmute(idx);
+        let next_arr: [u32; 4] = std::mem::transmute(idx_next);
+        let frac_arr: [f32; 4] = std::mem::transmute(fraction);
+
+        let lo0 = table[idx_arr[0] as usize];
+        let lo1 = table[idx_arr[1] as usize];
+        let lo2 = table[idx_arr[2] as usize];
+        let lo3 = table[idx_arr[3] as usize];
+        let hi0 = table[next_arr[0] as usize];
+        let hi1 = table[next_arr[1] as usize];
+        let hi2 = table[next_arr[2] as usize];
+        let hi3 = table[next_arr[3] as usize];
+
+        // Linear interpolation: lo + frac * (hi - lo)
+        let lo_vec = vld1q_f32([lo0, lo1, lo2, lo3].as_ptr());
+        let hi_vec = vld1q_f32([hi0, hi1, hi2, hi3].as_ptr());
+        let frac_vec = vld1q_f32(frac_arr.as_ptr());
+        let diff = vsubq_f32(hi_vec, lo_vec);
+        let result = vmlaq_f32(lo_vec, diff, frac_vec);
+
+        vst1q_f32(output.as_mut_ptr().add(i), result);
+        i += 4;
+    }
+
+    // Handle remaining elements with scalar
+    while i < len {
+        let x = input[i].clamp(EXP_MIN, EXP_MAX);
+        let normalized = (x - EXP_MIN) * EXP_STEP_INV;
+        let index = normalized as usize;
+        let fraction = normalized - index as f32;
+        let lo = table[index.min(EXP_TABLE_SIZE - 1)];
+        let hi = table[(index + 1).min(EXP_TABLE_SIZE - 1)];
+        output[i] = lo + (hi - lo) * fraction;
+        i += 1;
+    }
+}
+
+/// Fast exp for softmax - uses SIMD-accelerated lookup table
+pub fn exp_softmax_simd(input: &[f32], output: &mut [f32], level: SimdLevel) {
     let len = input.len().min(output.len());
-    // For softmax, accuracy is critical. Use std::exp which is well-optimized.
+    #[cfg(target_arch = "aarch64")]
+    {
+        if matches!(level, SimdLevel::Neon | SimdLevel::Neonfp16) {
+            unsafe { exp_simd_neon(input, output, len) };
+            return;
+        }
+    }
+    // Fallback for x86_64 or when NEON is not available
+    let table = get_exp_table();
     for i in 0..len {
-        output[i] = input[i].exp();
+        let x = input[i].clamp(EXP_MIN, EXP_MAX);
+        let normalized = (x - EXP_MIN) * EXP_STEP_INV;
+        let index = normalized as usize;
+        let fraction = normalized - index as f32;
+        let lo = table[index.min(EXP_TABLE_SIZE - 1)];
+        let hi = table[(index + 1).min(EXP_TABLE_SIZE - 1)];
+        output[i] = lo + (hi - lo) * fraction;
     }
 }
 
